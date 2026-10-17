@@ -21,8 +21,8 @@ android {
         // 23 = Android 6.0：Media3 的下限之上，老盒子都能装
         minSdk = 23
         targetSdk = 37
-        versionCode = 100
-        versionName = "1.0.0"
+        versionCode = 101
+        versionName = "1.1.0"
     }
 
     buildTypes {
@@ -40,6 +40,15 @@ android {
 
     buildFeatures {
         buildConfig = true
+    }
+
+    // 加 -Pdpadtv.release=true 构建就不带"测试版"字样；平时构建默认是测试版
+    defaultConfig {
+        buildConfigField(
+            "boolean",
+            "TEST_BUILD",
+            if (project.findProperty("dpadtv.release") == "true") "false" else "true",
+        )
     }
 
     defaultConfig {

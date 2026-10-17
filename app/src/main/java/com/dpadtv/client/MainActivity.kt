@@ -61,6 +61,12 @@ class MainActivity : Activity() {
     private var liveChannelSource: String = ""
     private var mediaType = "movie"
     private var recommendPage = 0
+    private var recommendTag = "热门"
+    private var isLoadingMore = false
+    private var noMoreRecommend = false
+    private var suppressAutoLoad = false
+    private var pendingGridSelection = -1
+    private var lastVisibleIndex = 0
     private var liveGroupFilter = ""
     private var sourceFilter = ""
     private var busyDialog: AlertDialog? = null
@@ -199,6 +205,7 @@ class MainActivity : Activity() {
         api = Api(prefs.serverUrl.ifEmpty { BuildConfig.DEFAULT_URL })
         api.restoreCookie(prefs.cookie)
         imageLoader = ImageLoader(api)
+        maybeCheckUpdate()
 
         root = FrameLayout(this)
         root.setBackgroundColor(Color.parseColor("#0b101a"))
@@ -249,6 +256,7 @@ class MainActivity : Activity() {
             "files" -> showSources()
             "qradd" -> { qrServer?.stop(); qrServer = null; showSources() }
             "results" -> showRecommend()
+            "serversettings" -> showSetup()
             "detail", "live", "sources", "setup", "history" -> showRecommend()
             "home" -> showRecommend()
             else -> super.onBackPressed()
@@ -307,16 +315,6 @@ class MainActivity : Activity() {
             },
         )
 
-        if (showTagline) {
-            row.addView(
-                TextView(this).apply {
-                    setText("v" + BuildConfig.VERSION_NAME)
-                    setTextSize(13f)
-                    setTextColor(0xFF64748B.toInt())
-                    gravity = Gravity.CENTER_VERTICAL
-                },
-            )
-        }
         return row
     }
 
@@ -757,21 +755,252 @@ class MainActivity : Activity() {
     /* ------------------------------------------------------------- 设置界面 */
 
     /** 设置页入口：已连接时只保留高频操作，连接设置收进「修改服务器设置」 */
+    /**
+     * 设置页入口。
+     * @param expand 明确要求展开「服务器连接」区块（用户点了「修改服务器设置」）。
+     * 其余情况（从菜单、返回键回来）自动收起 —— 之前这个标志一旦置真就永不复位，
+     * 导致改过一次服务器之后，再进设置永远是展开态、页脚也被挤掉。
+     */
     private fun showSetup() {
         currentScreen = "setup"
-        if (prefs.serverUrl.isNotEmpty() && !setupShowFields) showSetupCompact() else showSetupFull()
+        val hasServer = prefs.serverUrl.isNotEmpty()
+        if (prefs.serverUrl.isNotEmpty()) showSetupCompact() else showServerSettings()
     }
 
     /** 设置页底部的项目主页：开源后方便别人找到仓库，不抢眼但有存在感 */
     private fun githubFooter(): TextView = TextView(this).apply {
-        setText(
-            "项目主页  github.com/AresCNZJ/DpadTV\n" +
-                "免责声明：本应用仅为聚合客户端，不提供、不存储任何音视频内容，所有内容均来自用户自行配置的第三方接口。",
-        )
+        val latest = prefs.latestTag
+        val hasNew = UpdateChecker.isNewer(latest, BuildConfig.VERSION_NAME)
+        val devTag = if (BuildConfig.TEST_BUILD) "（测试版）" else ""
+        val head = "DpadTV v" + BuildConfig.VERSION_NAME + devTag + if (hasNew) "  •  有新版本 $latest" else ""
+        val tail = "\n项目主页  github.com/AresCNZJ/DpadTV\n" +
+            "免责声明：本应用仅为聚合客户端，不提供、不存储任何音视频内容，所有内容均来自用户自行配置的第三方接口。"
+        val span = SpannableString(head + tail)
+        if (hasNew) {
+            // 版本号后面加红点 + 提示，用警示色强调
+            val start = ("DpadTV v" + BuildConfig.VERSION_NAME).length
+            span.setSpan(
+                ForegroundColorSpan(0xFFEF4444.toInt()),
+                start,
+                head.length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        setText(span)
         setTextColor(0xFF64748B.toInt())
         setTextSize(13f)
         setLineSpacing(dp(4).toFloat(), 1f)
         setPadding(0, dp(18), 0, 0)
+    }
+    /**
+     * 更新检测：每次启动最多检查一次，且 6 小时内不重复请求。
+     * 请求只发一次（8 秒超时）；拿不到就放弃——失败也算作"已检查"，不会反复重试，
+     * 同时保留已知的新版本标记，不因一次断网就把提示抹掉。
+     */
+    private fun maybeCheckUpdate() {
+        val now = System.currentTimeMillis()
+        if (now - prefs.lastUpdateCheck < 6 * 3600_000L) return
+        UpdateChecker.check { tag ->
+            prefs.lastUpdateCheck = now
+            if (tag == null) return@check
+            if (UpdateChecker.isNewer(tag, BuildConfig.VERSION_NAME)) {
+                val firstSeen = prefs.latestTag != tag
+                prefs.latestTag = tag
+                if (firstSeen) toast("发现新版本 $tag，可在设置页查看")
+            } else {
+                prefs.latestTag = ""
+            }
+        }
+    }
+    /* --------------------------------------------------------- 首页按钮排序 */
+
+    /** 首页顶部按钮排序：上移 / 下移 / 恢复默认，改完立刻写回并重绘首页 */
+    private fun showHomeBarSettings() {
+        currentScreen = "homebar"
+        val order = prefs.homeBarOrder().filter { HomeBar.DEFAULT.contains(it) }.toMutableList()
+        for (id in HomeBar.DEFAULT) if (!order.contains(id)) order.add(id)
+        val hidden = prefs.homeBarHidden().toMutableSet()
+
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(48), dp(24), dp(48), dp(20))
+        }
+        col.addView(brandRow(false))
+        col.addView(titleText("首页按钮排序", 20f))
+        col.addView(hintText("选中一条按 OK：上移 / 下移 / 隐藏 / 恢复默认"))
+
+        val listView = newList()
+        fun refresh() {
+            prefs.saveHomeBarOrder(order)
+            prefs.saveHomeBarHidden(hidden)
+            bindList(listView, order.mapIndexed { i, id ->
+                val mark = if (hidden.contains(id)) "   （已隐藏）" else ""
+                "${i + 1}.  ${HomeBar.label(id)}$mark"
+            }, onItem = { idx ->
+                val id = order[idx]
+                val isHidden = hidden.contains(id)
+                AlertDialog.Builder(this)
+                    .setTitle(HomeBar.label(id) + if (isHidden) "（已隐藏）" else "")
+                    .setItems(
+                        arrayOf("上移", "下移", if (isHidden) "显示" else "隐藏", "恢复默认顺序"),
+                    ) { _, which ->
+                        when (which) {
+                            0 -> if (idx > 0) {
+                                val tmp = order[idx]; order[idx] = order[idx - 1]; order[idx - 1] = tmp
+                            } else {
+                                toast("已经在最前")
+                            }
+                            1 -> if (idx < order.size - 1) {
+                                val tmp = order[idx]; order[idx] = order[idx + 1]; order[idx + 1] = tmp
+                            } else {
+                                toast("已经在最后")
+                            }
+                            2 -> if (isHidden) {
+                                hidden.remove(id)
+                            } else if (order.size - hidden.size <= 1) {
+                                toast("至少要保留一个按钮")
+                            } else {
+                                hidden.add(id)
+                            }
+                            else -> {
+                                order.clear()
+                                order.addAll(HomeBar.DEFAULT)
+                                hidden.clear()
+                            }
+                        }
+                        refresh()
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            })
+        }
+        refresh()
+        col.addView(listView, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        bar.addView(button("返回设置") { showSetup() })
+        col.addView(hScroll(bar))
+        setScreen(col)
+    }
+    /** 播放缓存（磁盘）：显示占用并清空 */
+    private fun showClearPlaybackCache() {
+        val bytes = PlaybackCache.sizeBytes(this)
+        val mb = bytes / 1024.0 / 1024.0
+        val text = String.format(java.util.Locale.US, "当前占用 %.1f MB\n上限 2 GB，超出后自动淘汰最久未用的片段。", mb)
+        AlertDialog.Builder(this)
+            .setTitle("播放缓存")
+            .setMessage(text)
+            .setPositiveButton("清空") { _, _ ->
+                PlaybackCache.clear(this)
+                toast("已清空播放缓存")
+                showSetup()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+    /* ------------------------------------------------------------- 清理缓存 */
+
+    private fun showClearCache() {
+        val imgs = if (::imageLoader.isInitialized) imageLoader.cacheSize() else 0
+        val hist = prefs.history().size
+        val search = prefs.searchHistory().size
+        val progress = prefs.progressCount()
+        val diskMb = PlaybackCache.sizeBytes(this) / 1024.0 / 1024.0
+        val diskText = String.format(java.util.Locale.US, "%.1f MB", diskMb)
+        val msg = "图片缓存：$imgs 张\n观看历史：$hist 条\n搜索记录：$search 条\n" +
+            "播放进度：$progress 条\n播放缓存（磁盘）：$diskText\n\n片源配置、直播源和服务器设置不会被清除。"
+        AlertDialog.Builder(this)
+            .setTitle("清理缓存")
+            .setMessage(msg)
+            .setPositiveButton("清理") { _, _ ->
+                val n = imageLoader.clearCache()
+                prefs.clearHistory()
+                prefs.clearSearchHistory()
+                prefs.clearAllProgress()
+                toast("已清理（图片 $n 张、历史 $hist 条、搜索 $search 条、进度 $progress 条）")
+                showSetup()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+    /* ------------------------------------------------------------- 播放设置 */
+
+    /** 单选弹窗（用全局对话框主题，和片源操作菜单同一套样式） */
+    private fun chooseOption(title: String, options: List<String>, current: Int, onPick: (Int) -> Unit) {
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setSingleChoiceItems(options.toTypedArray(), current) { dialog, which ->
+                dialog.dismiss()
+                onPick(which)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+    /** 播放设置：每项点开菜单选择，和全站弹窗风格一致 */
+    private fun showPlaySettings() {
+        currentScreen = "playsettings"
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(48), dp(24), dp(48), dp(20))
+        }
+        col.addView(brandRow(false))
+        col.addView(titleText("播放设置", 20f))
+        col.addView(hintText("选中一条按 OK，在弹出的菜单里选择"))
+
+        fun rows(): List<String> = listOf(
+            "快进 / 快退步长    ${prefs.seekStepSeconds} 秒",
+            "自动连播下一集    ${if (prefs.autoNext) "开" else "关"}",
+            "记住播放进度      ${if (prefs.resumeEnabled) "开" else "关"}",
+            "续播起始位置      超过 ${prefs.resumeThresholdSeconds} 秒",
+            "解码方式          " + when (prefs.decodeMode) { 1 -> "强制软解"; 2 -> "强制硬解"; else -> "自动" },
+            "播放缓存上限      " + when (prefs.cacheLimitMb) {
+                512 -> "512 MB"
+                1024 -> "1 GB"
+                4096 -> "4 GB"
+                else -> "2 GB"
+            },
+        )
+
+        val listView = newList()
+        fun refresh() {
+            bindList(listView, rows(), onItem = { idx ->
+                when (idx) {
+                    0 -> chooseOption("快进 / 快退步长", listOf("10 秒", "15 秒", "30 秒"),
+                        listOf(10, 15, 30).indexOf(prefs.seekStepSeconds).coerceAtLeast(0)
+                    ) { i -> prefs.seekStepSeconds = listOf(10, 15, 30)[i]; refresh() }
+                    1 -> chooseOption("自动连播下一集", listOf("开", "关"),
+                        if (prefs.autoNext) 0 else 1
+                    ) { i -> prefs.autoNext = (i == 0); refresh() }
+                    2 -> chooseOption("记住播放进度", listOf("开", "关"),
+                        if (prefs.resumeEnabled) 0 else 1
+                    ) { i -> prefs.resumeEnabled = (i == 0); refresh() }
+                    3 -> chooseOption("续播起始位置", listOf("超过 5 秒", "超过 30 秒", "超过 60 秒"),
+                        listOf(5, 30, 60).indexOf(prefs.resumeThresholdSeconds).coerceAtLeast(0)
+                    ) { i -> prefs.resumeThresholdSeconds = listOf(5, 30, 60)[i]; refresh() }
+                    4 -> chooseOption("解码方式（下次播放生效）", listOf("自动", "强制软解", "强制硬解"),
+                        prefs.decodeMode.coerceIn(0, 2)
+                    ) { i -> prefs.decodeMode = i; refresh() }
+                    5 -> chooseOption(
+                        "播放缓存上限",
+                        listOf("512 MB", "1 GB", "2 GB", "4 GB"),
+                        listOf(512, 1024, 2048, 4096).indexOf(prefs.cacheLimitMb).coerceAtLeast(2),
+                    ) { i ->
+                        prefs.cacheLimitMb = listOf(512, 1024, 2048, 4096)[i]
+                        PlaybackCache.recreate(this)
+                        toast("已设为 ${listOf("512 MB", "1 GB", "2 GB", "4 GB")[i]}，下次播放生效")
+                        refresh()
+                    }
+                }
+            })
+        }
+        refresh()
+        col.addView(listView, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        bar.addView(button("返回设置") { showSetup() })
+        col.addView(hScroll(bar))
+        setScreen(col)
     }
     private fun showSetupCompact() {
         val col = LinearLayout(this).apply {
@@ -787,31 +1016,25 @@ class MainActivity : Activity() {
             setPadding(0, dp(12), 0, dp(22))
         })
         col.addView(button("片源管理", primary = true) { showSources() })
-        col.addView(button("修改服务器设置") { setupShowFields = true; showSetup() })
+        col.addView(button("播放设置") { showPlaySettings() })
+        col.addView(button("清理缓存") { showClearCache() })
+        col.addView(button("首页按钮排序") { showHomeBarSettings() })
+        col.addView(button("修改服务器设置") { showServerSettings() })
         col.addView(button("返回") { showRecommend() })
         col.addView(githubFooter())
         setScreen(ScrollView(this).apply { addView(col) })
     }
 
-    private fun showSetupFull() {        currentScreen = "setup"
+    /** 服务器设置：只负责地址与密码，其他入口都在设置摘要页 */
+    private fun showServerSettings() {
+        currentScreen = "serversettings"
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(56), dp(36), dp(56), dp(36))
         }
-        col.addView(brandRow())
-        col.addView(hintText("服务器与片源  ·  已配置 ${prefs.sources().size} 个片源"))
-        col.addView(hintText("这是 LibreTV 的电视客户端：直接连你自己的服务器，不走网页、不受系统浏览器内核限制。"))
-        col.addView(TextView(this).apply {
-            setText(
-                "第一次使用，三步：\n" +
-                    "1. 确认下面的服务器地址，填访问密码，点「连接并登录」\n" +
-                    "2. 进「片源管理」加采集站（可以粘贴 sources.json 全文，本地解析）\n" +
-                    "3. 回首页搜片名，点海报/结果进详情，选集播放",
-            )
-            setTextSize(15f)
-            setTextColor(Color.parseColor("#cbd5e1"))
-            setPadding(0, dp(8), 0, dp(16))
-        })
+        col.addView(brandRow(false))
+        col.addView(titleText("服务器设置", 20f))
+        col.addView(hintText("填写 LibreTV 服务端的地址与访问密码"))
 
         val urlField = field(BuildConfig.DEFAULT_URL, prefs.serverUrl.ifEmpty { BuildConfig.DEFAULT_URL })
         col.addView(urlField)
@@ -819,17 +1042,21 @@ class MainActivity : Activity() {
         col.addView(pwdField)
 
         val statusLine = TextView(this).apply {
-            setText(if (prefs.serverUrl.isEmpty()) "未连接" else "上次连接：${prefs.serverUrl}")
+            setText(if (prefs.serverUrl.isEmpty()) "未连接" else "上次连接：" + prefs.serverUrl)
             setTextColor(Color.parseColor("#94a3b8"))
             setTextSize(15f)
-            setPadding(0, dp(12), 0, dp(4))
+            setPadding(0, dp(14), 0, dp(6))
         }
         col.addView(statusLine)
 
-        col.addView(button("连接并登录", primary = true) {
+        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        bar.addView(button("连接并登录", primary = true) {
             val url = urlField.text.toString().trim()
             val pwd = pwdField.text.toString()
-            if (url.isEmpty()) { toast("请填服务器地址"); return@button }
+            if (url.isEmpty()) {
+                toast("请填服务器地址")
+                return@button
+            }
             api = Api(url)
             api.restoreCookie(prefs.cookie)
             imageLoader = ImageLoader(api)
@@ -837,39 +1064,32 @@ class MainActivity : Activity() {
                 val st = api.status()
                 val verified = if (st.passwordRequired && !st.verified) {
                     api.login(pwd).verified
-                } else st.verified
+                } else {
+                    st.verified
+                }
                 Triple(st, verified, pwd)
-            }, { (st, verified, pwd) ->
+            }, { (st, verified, pw) ->
                 prefs.serverUrl = url
-                prefs.password = pwd
+                prefs.password = pw
                 api.currentCookie()?.let { prefs.cookie = it }
-                statusLine.setText("已连接 · v${st.version} · 密码已保存")
                 toast(if (verified) "已连接 v${st.version}" else "已连接，但登录未生效")
                 seedFromServer(st)
-                if (prefs.sources().isEmpty()) showSources() else showRecommend()
+                showSetup()
             })
         })
-
-        col.addView(button("片源管理") { showSources() })
-        // 「开始搜索」是早期遗留（那时还没有首页），现在首页/搜索在底部栏已有入口，
-        // 设置页只保留：连接、管片源、返回
-        col.addView(button("返回") {
-            // 先把没提交的地址/密码存下来，避免改完直接返回导致丢失
+        bar.addView(button("返回") {
+            // 改了没提交也要存下来，避免白填
             if (urlField.text.toString().trim().isNotEmpty()) {
                 prefs.serverUrl = urlField.text.toString().trim()
             }
             if (pwdField.text.toString().isNotEmpty()) {
                 prefs.password = pwdField.text.toString()
             }
-            if (prefs.serverUrl.isEmpty()) {
-                toast("先点上面的「连接并登录」")
-            } else {
-                showRecommend()
-            }
+            showSetup()
         })
+        col.addView(hScroll(bar))
 
-        val scroll = ScrollView(this).apply { addView(col) }
-        setScreen(scroll)
+        setScreen(ScrollView(this).apply { addView(col) })
         urlField.requestFocus()
     }
 
@@ -1558,6 +1778,27 @@ class MainActivity : Activity() {
 
     /* --------------------------------------------------------------- 搜索页 */
 
+    /* --------------------------------------------------------------- 热门搜索 */
+
+    /** 搜索页热门搜索：按类型缓存，取首页排行榜前 10 条 */
+    private val hotSearchTitles = mutableMapOf<String, List<String>>()
+
+    private fun ensureHotSearch() {
+        if (hotSearchTitles.size >= 3) return
+        scope.launch {
+            val specs = listOf("movie" to "热门", "tv" to "热门", "show" to "综艺")
+            for ((type, tag) in specs) {
+                if (hotSearchTitles.containsKey(type)) continue
+                val items = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { api.douban(type, tag, 0, 10) }.getOrDefault(emptyList())
+                }
+                hotSearchTitles[type] = items.map { it.title }.filter { it.isNotBlank() }
+            }
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                if (currentScreen == "home") showHome()
+            }
+        }
+    }
     private fun showHome() {
         currentScreen = "home"
         val col = LinearLayout(this).apply {
@@ -1569,13 +1810,25 @@ class MainActivity : Activity() {
         col.addView(brandRow(false))
         val keywordField = field("输入影片名称…")
         keywordField.imeOptions = EditorInfo.IME_ACTION_SEARCH
-        header.addView(keywordField, LinearLayout.LayoutParams(0, dp(48), 1f))
+        header.addView(keywordField, LinearLayout.LayoutParams(dp(580), dp(48)))
         header.addView(button("搜索", primary = true) { doSearch(keywordField.text.toString()) })
-        header.addView(button("片源") { showSources() })
-        header.addView(button("推荐") { recommendItems = emptyList(); showRecommend() })
-        header.addView(button("直播") { liveChannels = emptyList(); showLive() })
-        header.addView(button("设置") { showSetup() })
+        header.addView(button("清空历史") { prefs.clearSearchHistory(); showHome() })
         col.addView(hScroll(header))
+
+        // 热门搜索：电影 / 剧集 / 综艺 各取排行榜前 10，点一下直接搜
+        ensureHotSearch()
+        for ((type, label) in listOf(
+            "movie" to "热门电影",
+            "tv" to "热门剧集",
+            "show" to "热门综艺",
+        )) {
+            val titles = hotSearchTitles[type].orEmpty()
+            if (titles.isEmpty()) continue
+            col.addView(hintText(label))
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            titles.forEach { title -> row.addView(button(title) { doSearch(title) }) }
+            col.addView(hScroll(row))
+        }
 
         val statusRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1619,7 +1872,7 @@ class MainActivity : Activity() {
                 rows = listOf("（还没有搜索记录，输入片名开始）")
                 onRow = { }
             } else {
-                rows = history.map { "最近搜索 · $it" } + "清空搜索历史"
+                rows = history.map { "最近搜索 · $it" }
                 onRow = { idx ->
                     if (idx == history.size) {
                         prefs.clearSearchHistory()
@@ -1982,6 +2235,24 @@ class MainActivity : Activity() {
 
     /** 继续观看：卡片形式（封面 + 片名 + 进度） */
     private fun showHistoryCards() {
+        // 历史里缺封面的记录：用片名反查一次，拿到海报就写回（最多补 5 条）
+        prefs.history().filter { it.cover.isEmpty() }.take(5).forEach { h ->
+            scope.launch {
+                val items = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching {
+                        api.search(h.title, prefs.sources().filter { it.enabled }).items
+                    }.getOrDefault(emptyList())
+                }
+                val cover = items.firstOrNull { it.name == h.title }?.pic
+                    ?: items.firstOrNull()?.pic.orEmpty()
+                if (cover.isNotEmpty()) {
+                    prefs.updateHistoryCover(h.playUrl, cover)
+                    withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        if (currentScreen == "history") showHistoryCards()
+                    }
+                }
+            }
+        }
         currentScreen = "history"
         val items2 = prefs.history()
         val col = LinearLayout(this).apply {
@@ -2085,20 +2356,30 @@ class MainActivity : Activity() {
         }
         col.addView(brandRow())
         col.addView(titleText(
-            (if (mediaType == "tv") "豆瓣热门 · 剧集" else "豆瓣热门 · 电影") +
+            (when {
+                recommendTag == "综艺" -> "豆瓣 · 综艺"
+                mediaType == "tv" -> "豆瓣 · " + recommendTag + " · 剧集"
+                else -> "豆瓣 · " + recommendTag + " · 电影"
+            }) +
                 "  ·  第 ${recommendPage + 1} 批，共 ${recommendItems.size} 条",
             17f,
         ))
 
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        bar.addView(button("电影") { mediaType = "movie"; recommendItems = emptyList(); recommendPage = 0; showRecommend() })
-        bar.addView(button("剧集") { mediaType = "tv"; recommendItems = emptyList(); recommendPage = 0; showRecommend() })
-        bar.addView(button("更多") { loadRecommend(true) })
-        bar.addView(button("搜索") { showHome() })
-        bar.addView(button("直播") { liveChannels = emptyList(); showLive() })
-        bar.addView(button("继续") { showHistoryCards() })
-        bar.addView(button("片源") { showSources() })
-        bar.addView(button("设置") { showSetup() })
+        val hiddenIds = prefs.homeBarHidden()
+        for (id in prefs.homeBarOrder()) {
+            if (hiddenIds.contains(id)) continue
+            when (id) {
+                "movie" -> bar.addView(button("电影") { mediaType = "movie"; recommendTag = "热门"; recommendItems = emptyList(); recommendPage = 0; noMoreRecommend = false; isLoadingMore = false; showRecommend() })
+                "tv" -> bar.addView(button("剧集") { mediaType = "tv"; recommendTag = "热门"; recommendItems = emptyList(); recommendPage = 0; noMoreRecommend = false; isLoadingMore = false; showRecommend() })
+                "show" -> bar.addView(button("综艺") { mediaType = "show"; recommendTag = "综艺"; recommendItems = emptyList(); recommendPage = 0; noMoreRecommend = false; isLoadingMore = false; showRecommend() })
+                "search" -> bar.addView(button("搜索") { showHome() })
+                "live" -> bar.addView(button("直播") { liveChannels = emptyList(); showLive() })
+                "history" -> bar.addView(button("继续") { showHistoryCards() })
+                "sources" -> bar.addView(button("片源") { showSources() })
+                "setup" -> bar.addView(button("设置") { showSetup() })
+            }
+        }
         col.addView(hScroll(bar))
 
         val grid = newGrid().apply {
@@ -2108,6 +2389,57 @@ class MainActivity : Activity() {
             setPadding(0, dp(12), 0, 0)
         }
         grid.adapter = recommendAdapter()
+            if (pendingGridSelection >= 0) {
+                grid.setSelection(pendingGridSelection)
+                pendingGridSelection = -1
+                suppressAutoLoad = true
+            }
+            grid.setOnScrollListener(object : android.widget.AbsListView.OnScrollListener {
+                override fun onScrollStateChanged(view: android.widget.AbsListView, state: Int) = Unit
+                override fun onScroll(
+                    view: android.widget.AbsListView,
+                    firstVisibleItem: Int,
+                    visibleItemCount: Int,
+                    totalItemCount: Int,
+                ) {
+                    lastVisibleIndex = firstVisibleItem
+                    if (suppressAutoLoad) {
+                        suppressAutoLoad = false
+                        return
+                    }
+                    // 滚到末尾前两行时自动加载下一批
+                    if (!isLoadingMore && !noMoreRecommend &&
+                        firstVisibleItem + visibleItemCount >= totalItemCount - 2
+                    ) {
+                        loadRecommend(true)
+                    }
+                }
+            })
+            // 顶部栏在 HorizontalScrollView 内，焦点搜索找不到下方网格，这里直接接管
+            for (bi in 0 until bar.childCount) {
+                bar.getChildAt(bi).setOnKeyListener { _, code, ev ->
+                    if (code == android.view.KeyEvent.KEYCODE_DPAD_DOWN &&
+                        ev.action == android.view.KeyEvent.ACTION_DOWN
+                    ) {
+                        grid.requestFocus()
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+            // 网格已在第一行时，上方向键回到顶部按钮
+            grid.setOnKeyListener { _, code, ev ->
+                if (code == android.view.KeyEvent.KEYCODE_DPAD_UP &&
+                    ev.action == android.view.KeyEvent.ACTION_DOWN &&
+                    grid.selectedItemPosition < grid.numColumns
+                ) {
+                    if (bar.childCount > 0) bar.getChildAt(0).requestFocus()
+                    true
+                } else {
+                    false
+                }
+            }
         grid.setOnItemClickListener { _, _, pos, _ ->
             recommendItems.getOrNull(pos)?.let { doSearch(it.title) }
         }
@@ -2119,13 +2451,17 @@ class MainActivity : Activity() {
     }
 
     private fun loadRecommend(more: Boolean = false) {
+        if (more && (isLoadingMore || noMoreRecommend)) return
+        isLoadingMore = true
         val page = if (more) recommendPage + 1 else 0
         runApi(if (more) "加载更多…" else "正在加载推荐…", {
-            api.douban(mediaType, "热门", page * 48, 48)
+            api.douban(mediaType, recommendTag, page * 48, 48)
         }, { items ->
+            isLoadingMore = false
             if (items.isEmpty()) {
                 if (more) {
-                    toast("没有更多了")
+                    noMoreRecommend = true
+                    toast("已经到底了")
                 } else {
                     toast("没取到推荐，直接用搜索吧")
                     showHome()
@@ -2133,6 +2469,8 @@ class MainActivity : Activity() {
             } else {
                 recommendItems = if (more) recommendItems + items else items
                 recommendPage = page
+                // 追加时记住当前滚动位置，重建网格后回到原处，避免"跳回顶部"又触发加载
+                if (more) pendingGridSelection = lastVisibleIndex
                 showRecommend()
             }
         })

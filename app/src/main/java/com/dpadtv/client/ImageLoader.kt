@@ -54,4 +54,12 @@ class ImageLoader(private val api: Api) {
             null
         }
     }
+    /** 清空内存中的海报缓存，返回清掉的张数 */
+    fun clearCache(): Int {
+        val n = cache.size()
+        cache.evictAll()
+        return n
+    }
+
+    fun cacheSize(): Int = cache.size()
 }
