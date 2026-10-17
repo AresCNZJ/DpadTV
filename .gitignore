@@ -1,0 +1,19 @@
+# Android / Gradle
+build/
+.gradle/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 交付物（APK 不入库，走 Releases）
+dist/
+
+# 本机调试用的截图（真机/模拟器现场图）
+docs/adb-*.png
+
+# 系统
+.DS_Store
+Thumbs.db
