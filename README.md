@@ -51,9 +51,13 @@
 
 ![首页](docs/screenshot-home.png)
 
-### 详情
+### 详情与集数选择
 
 ![详情](docs/screenshot-detail.png)
+
+### 添加片源
+
+![添加片源](docs/screenshot-addsource.png)
 
 ### 扫码添加片源
 
