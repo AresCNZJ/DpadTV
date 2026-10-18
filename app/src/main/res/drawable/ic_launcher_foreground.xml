@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  桌面图标的前景层（矢量）。
+  右指向三角形按「视觉重心」居中：外接框中心右移 2dp。
+  原因是三角形质量偏左，严格按外接框居中看起来会偏左。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M44.55,37.3 L67.45,54 L44.55,70.7 Z" />
+</vector>

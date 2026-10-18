@@ -7,17 +7,24 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * 检查 GitHub Releases 的最新 tag。
+ * 检查 GitHub Releases 的最新版本。
  *
- * 只请求 `/releases/latest` 拿 tag 名，不下载任何二进制；
- * 请求失败（断网、限流、仓库没发 Release）都会安静地返回 null，不影响使用。
+ * 只请求 `/releases/latest`（一次），拿 tag 名、更新说明和页面地址；
+ * 失败（断网、被墙、限流、仓库没发 Release）静默返回 null，不影响使用。
  */
 object UpdateChecker {
+
     private const val API = "https://api.github.com/repos/AresCNZJ/DpadTV/releases/latest"
 
-    fun check(onResult: (String?) -> Unit) {
+    data class ReleaseInfo(
+        val tag: String,
+        val notes: String,
+        val url: String,
+    )
+
+    fun check(onResult: (ReleaseInfo?) -> Unit) {
         Thread {
-            val tag = try {
+            val info = try {
                 val conn = URL(API).openConnection() as HttpURLConnection
                 conn.connectTimeout = 8000
                 conn.readTimeout = 8000
@@ -25,16 +32,24 @@ object UpdateChecker {
                 conn.setRequestProperty("Accept", "application/vnd.github+json")
                 if (conn.responseCode == 200) {
                     val body = conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
-                    JSONObject(body).optString("tag_name", "").ifEmpty { null }
+                    val o = JSONObject(body)
+                    val tag = o.optString("tag_name", "")
+                    if (tag.isEmpty()) {
+                        null
+                    } else {
+                        ReleaseInfo(
+                            tag = tag,
+                            notes = o.optString("body", ""),
+                            url = o.optString("html_url", ""),
+                        )
+                    }
                 } else {
                     null
                 }
             } catch (e: Exception) {
                 null
-            } finally {
-                // 不主动断开连接池里的长连接，交给 JVM 回收
             }
-            Handler(Looper.getMainLooper()).post { onResult(tag) }
+            Handler(Looper.getMainLooper()).post { onResult(info) }
         }.start()
     }
 

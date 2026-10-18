@@ -257,12 +257,39 @@ class MainActivity : Activity() {
             "qradd" -> { qrServer?.stop(); qrServer = null; showSources() }
             "results" -> showRecommend()
             "serversettings" -> showSetup()
-            "detail", "live", "sources", "setup", "history" -> showRecommend()
-            "home" -> showRecommend()
-            else -> super.onBackPressed()
+            "detail", "live", "setup", "history" -> showRecommend()
+            "sources" -> if (sourcesOrigin == "setup") showSetup() else showRecommend()
+            "home", "recommend" -> super.onBackPressed()
+            // 导入流程内的页面：逐级退回上一级，而不是退出 App
+            "input" -> showAddSource()
+            "manualadd" -> showAddSource()
+            "addsource" -> showSources()
+            "import" -> showSources()
+            "homebar", "playsettings" -> showSetup()
+            "boot" -> super.onBackPressed()
+            else -> showRecommend()
         }
     }
 
+    /**
+     * 首页顶部按钮栏的左右键拦截。
+     * 系统在 View 层就完成了焦点搜索，等到 onKeyDown 已经太晚，
+     * 所以在派发之前判断：邻居不在同一个栏里，就直接吞掉按键。
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN &&
+            (event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT || event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT)
+        ) {
+            val bar = homeBar
+            val focused = currentFocus
+            val dir = if (event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) View.FOCUS_RIGHT else View.FOCUS_LEFT
+            val next = focused?.focusSearch(dir)
+            if (bar != null && focused != null && focused.parent === bar) {
+                if (next == null || next.parent !== bar) return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
     /* ------------------------------------------------------------ 通用小工具 */
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -691,6 +718,38 @@ class MainActivity : Activity() {
      * 简易文件浏览器：只列目录与 .json，纯 D-pad 操作。
      * 起点 /storage（U 盘一般挂在 /storage/xxxx-xxxx 或 /mnt/media_rw）。
      */
+    /** 判断是不是可导入的文本类文件 */
+    private fun isImportableFile(name: String): Boolean {
+        val n = name.lowercase()
+        return n.endsWith(".json") || n.endsWith(".txt") ||
+            n.endsWith(".m3u") || n.endsWith(".m3u8")
+    }
+
+    /**
+     * Android 11+ 的分区存储下，直接 listFiles() 常常返回空。
+     * 这里依次试几个常见位置，返回第一个「存在且能列出内容」的目录，
+     * 让内置浏览器至少有个能用的起点（U 盘 / 下载目录 / 内置存储根）。
+     */
+    private fun findReadableStorageRoot(): String? {
+        val candidates = mutableListOf(
+            "/sdcard/Download",
+            "/storage/emulated/0/Download",
+            "/sdcard",
+            "/storage/emulated/0",
+            "/mnt/media_rw",
+            "/storage",
+        )
+        runCatching {
+            java.io.File("/storage").listFiles()?.forEach { f ->
+                if (f.isDirectory) candidates.add(f.absolutePath)
+            }
+        }
+        for (p in candidates) {
+            val dir = java.io.File(p)
+            if (dir.isDirectory && dir.listFiles()?.isNotEmpty() == true) return p
+        }
+        return null
+    }
     private fun showFileBrowser(path: String = browsePath) {
         currentScreen = "files"
         if (!ensureReadPermission()) return
@@ -718,7 +777,38 @@ class MainActivity : Activity() {
         bar.addView(button("返回片源管理") { showSources() })
         bar.addView(button("/sdcard") { showFileBrowser("/sdcard") })
         bar.addView(button("/storage") { showFileBrowser("/storage") })
+        bar.addView(button("自动查找") {
+            val found = findReadableStorageRoot()
+            if (found != null) {
+                showFileBrowser(found)
+            } else {
+                toast("系统限制访问存储，请改用「粘贴文本」或「从网址下载」")
+            }
+        })
         col.addView(hScroll(bar))
+        // 顶部栏是横向滚动容器：左右键若找不到可见邻居，就吞掉按键，避免焦点跑到屏幕外
+        for (bi in 0 until bar.childCount) {
+            val bv = bar.getChildAt(bi)
+            bv.setOnKeyListener { view, code, ev ->
+                if (ev.action != android.view.KeyEvent.ACTION_DOWN) {
+                    false
+                } else if (code == android.view.KeyEvent.KEYCODE_DPAD_LEFT ||
+                    code == android.view.KeyEvent.KEYCODE_DPAD_RIGHT
+                ) {
+                    val dir = if (code == android.view.KeyEvent.KEYCODE_DPAD_LEFT) {
+                        View.FOCUS_LEFT
+                    } else {
+                        View.FOCUS_RIGHT
+                    }
+                    val next = view.focusSearch(dir)
+                    // 没有邻居，或邻居不可见（在滚动区域外）时，消费掉按键
+                    // 只允许在按钮栏内部移动：邻居跑到栏外（比如海报格子）就吞掉按键
+                    next == null || next.parent !== bar
+                } else {
+                    false
+                }
+            }
+        }
 
         if (entries.isEmpty()) {
             col.addView(hintText("这个目录为空或无权访问。试试 /storage 或 /sdcard。"))
@@ -728,8 +818,8 @@ class MainActivity : Activity() {
                 val f = entries[idx].second
                 if (f.isDirectory) {
                     showFileBrowser(f.absolutePath)
-                } else if (!f.name.lowercase().endsWith(".json")) {
-                    toast("只支持 .json 文件")
+                } else if (!isImportableFile(f.name)) {
+                    toast("只支持 .json / .txt / .m3u 文件")
                 } else {
                     runApi("读取文件…", { f.readText() }, { text -> importText(text) })
                 }
@@ -800,18 +890,117 @@ class MainActivity : Activity() {
     private fun maybeCheckUpdate() {
         val now = System.currentTimeMillis()
         if (now - prefs.lastUpdateCheck < 6 * 3600_000L) return
-        UpdateChecker.check { tag ->
+        UpdateChecker.check { info ->
             prefs.lastUpdateCheck = now
-            if (tag == null) return@check
-            if (UpdateChecker.isNewer(tag, BuildConfig.VERSION_NAME)) {
-                val firstSeen = prefs.latestTag != tag
-                prefs.latestTag = tag
-                if (firstSeen) toast("发现新版本 $tag，可在设置页查看")
+            if (info == null) return@check
+            if (UpdateChecker.isNewer(info.tag, BuildConfig.VERSION_NAME)) {
+                val firstSeen = prefs.latestTag != info.tag
+                prefs.latestTag = info.tag
+                prefs.latestNotes = info.notes
+                prefs.latestUrl = info.url
+                if (firstSeen) toast("发现新版本 ${info.tag}，首页右上角可查看")
             } else {
                 prefs.latestTag = ""
+                prefs.latestNotes = ""
+                prefs.latestUrl = ""
             }
         }
     }
+    /* --------------------------------------------------------- 更新提示 */
+
+    /** 首页右上角的更新胶囊：有新版本且开关打开时才出现 */
+    private fun updateCapsule(): TextView? {
+        if (!prefs.updateBannerEnabled) return null
+        val tag = prefs.latestTag
+        if (!UpdateChecker.isNewer(tag, BuildConfig.VERSION_NAME)) return null
+        val unseen = prefs.updateBannerSeen != tag
+        return button(if (unseen) "● 新版本 $tag" else "新版本 $tag") {
+            prefs.updateBannerSeen = tag
+            showUpdateDetail()
+        }.apply {
+            if (!unseen) setTextColor(0xFF94A3B8.toInt())
+        }
+    }
+
+    private fun showUpdateDetail() {
+        val notes = prefs.latestNotes.ifEmpty { "（这个版本没有提供更新说明）" }
+        val url = prefs.latestUrl.ifEmpty { "https://github.com/AresCNZJ/DpadTV/releases" }
+
+        // 左栏：更新说明，内容长时可滚动
+        val notesView = TextView(this).apply {
+            setText(notes)
+            setTextColor(Color.parseColor("#cbd5e1"))
+            setTextSize(14f)
+            setLineSpacing(dp(5).toFloat(), 1f)
+            setPadding(0, 0, dp(20), 0)
+        }
+        val notesScroll = android.widget.ScrollView(this).apply {
+            addView(notesView)
+            layoutParams = LinearLayout.LayoutParams(0, dp(300), 1f)
+        }
+
+        // 右栏：白色圆角卡片包住二维码，下面跟一行提示
+        val qrCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.WHITE)
+                cornerRadius = dp(12).toFloat()
+            }
+        }
+        qrBitmap(url, dp(168))?.let { bmp ->
+            qrCard.addView(ImageView(this).apply { setImageBitmap(bmp) })
+        }
+        val right = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            addView(qrCard, LinearLayout.LayoutParams(dp(196), dp(196)))
+            addView(TextView(this@MainActivity).apply {
+                setText("扫码下载")
+                setTextColor(Color.parseColor("#94a3b8"))
+                setTextSize(13f)
+                setPadding(0, dp(12), 0, 0)
+            })
+            addView(TextView(this@MainActivity).apply {
+                setText(url)
+                setTextColor(0xFF38BDF8.toInt())
+                setTextSize(11f)
+                setPadding(0, dp(6), 0, 0)
+            })
+        }
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(24), dp(18), dp(24), dp(4))
+            addView(notesScroll)
+            addView(right)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("新版本 " + prefs.latestTag + "（当前 " + BuildConfig.VERSION_NAME + "）")
+            .setView(row)
+            .setPositiveButton("知道了") { _, _ -> showRecommend() }
+            .show()
+    }
+
+    /** 把任意文本渲染成二维码位图（复用 ZXing） */
+    private fun qrBitmap(text: String, sizePx: Int): android.graphics.Bitmap? = runCatching {
+        val matrix = com.google.zxing.qrcode.QRCodeWriter()
+            .encode(text, com.google.zxing.BarcodeFormat.QR_CODE, sizePx, sizePx)
+        android.graphics.Bitmap
+            .createBitmap(sizePx, sizePx, android.graphics.Bitmap.Config.ARGB_8888)
+            .also { b ->
+                for (x in 0 until sizePx) {
+                    for (y in 0 until sizePx) {
+                        b.setPixel(
+                            x, y,
+                            if (matrix.get(x, y)) 0xFF0B101A.toInt() else 0xFFFFFFFF.toInt(),
+                        )
+                    }
+                }
+            }
+    }.getOrNull()
     /* --------------------------------------------------------- 首页按钮排序 */
 
     /** 首页顶部按钮排序：上移 / 下移 / 恢复默认，改完立刻写回并重绘首页 */
@@ -899,6 +1088,15 @@ class MainActivity : Activity() {
             .setNegativeButton("取消", null)
             .show()
     }
+    /** 片源管理是从哪进来的：设置页或首页，返回时回到原处 */
+    private var sourcesOrigin = "home"
+
+    /** 首页顶部按钮栏；用来拦截左右键，避免焦点跑到栏外 */
+    private var homeBar: LinearLayout? = null
+
+    /** 正在测试中的源（列表右侧显示「…」） */
+    private val testingUrls = mutableSetOf<String>()
+
     /* ------------------------------------------------------------- 清理缓存 */
 
     private fun showClearCache() {
@@ -1019,6 +1217,10 @@ class MainActivity : Activity() {
         col.addView(button("播放设置") { showPlaySettings() })
         col.addView(button("清理缓存") { showClearCache() })
         col.addView(button("首页按钮排序") { showHomeBarSettings() })
+        col.addView(button("首页更新提示：" + if (prefs.updateBannerEnabled) "开" else "关") {
+            prefs.updateBannerEnabled = !prefs.updateBannerEnabled
+            showSetup()
+        })
         col.addView(button("修改服务器设置") { showServerSettings() })
         col.addView(button("返回") { showRecommend() })
         col.addView(githubFooter())
@@ -1099,9 +1301,12 @@ class MainActivity : Activity() {
 
     /** 片源管理：列表为主，导入走独立页面；每条可编辑/停用/上移下移/测试/删除 */
     private fun showSources() {
+        // 记录来源：从设置页进来的，返回时回设置；从首页进来的回首页
+        sourcesOrigin = if (currentScreen == "setup") "setup" else "home"
         currentScreen = "sources"
         val sources = prefs.sources()
         val enabledCount = sources.count { it.enabled }
+
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(40), dp(20), dp(40), dp(16))
@@ -1111,30 +1316,136 @@ class MainActivity : Activity() {
 
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         bar.addView(button("添加片源", primary = true) { showAddSource() })
+        bar.addView(button("全部测试") { runAllSourceTests() })
         bar.addView(button("完成，回首页") { showRecommend() })
         col.addView(hScroll(bar))
-        col.addView(hintText("选中一条可编辑 / 停用 / 排序 / 测试 / 删除；长按直接删除"))
+        col.addView(hintText("OK 打开操作菜单 · 长按直接启用/停用"))
 
-        if (sources.isEmpty()) {
-            col.addView(hintText("还没有片源。点「添加片源」导入 sources.json 或手动添加采集站。"))
-        } else {
-            val listView = newList()
-            bindList(listView, sources.map { s ->
-                (if (s.enabled) "● " else "○ ") + s.name + "\n    " + s.url
-            }, onItem = { idx -> sourceActions(idx) })
-            listView.setOnItemLongClickListener { _, _, pos, _ ->
-                val list = prefs.sources()
-                if (pos in list.indices) {
-                    prefs.saveSources(list.filterIndexed { i, _ -> i != pos })
-                    toast("已删除「${list[pos].name}」")
-                    showSources()
+        val liveCount = prefs.liveUrls().size
+        val rows = sources
+        val listView = newList()
+        listView.adapter = object : BaseAdapter() {
+            override fun getCount(): Int = rows.size + 1
+
+            override fun getItem(position: Int): Any = position
+
+            override fun getItemId(position: Int): Long = position.toLong()
+
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val row = (convertView as? LinearLayout) ?: LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(8), dp(14), dp(8), dp(14))
                 }
-                true
+                row.removeAllViews()
+                if (position >= rows.size) {
+                    // 末尾一行：直播源入口
+                    row.addView(TextView(this@MainActivity).apply {
+                        text = "  ▸  直播源 $liveCount 个 · 管理"
+                        setTextColor(ACCENT)
+                        setTextSize(16f)
+                    })
+                    return row
+                }
+                val s = rows[position]
+                val dot = View(this@MainActivity).apply {
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        shape = android.graphics.drawable.GradientDrawable.OVAL
+                        setColor(if (s.enabled) ACCENT else Color.parseColor("#64748b"))
+                    }
+                }
+                val name = TextView(this@MainActivity).apply {
+                    text = s.name
+                    setTextColor(TEXT_COLOR)
+                    setTextSize(16f)
+                    isSingleLine = true
+                    maxWidth = dp(360)
+                }
+                val domain = TextView(this@MainActivity).apply {
+                    text = s.url
+                    setTextColor(Color.parseColor("#64748b"))
+                    setTextSize(13f)
+                    isSingleLine = true
+                    ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+                    setPadding(dp(20), 0, dp(12), 0)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                }
+                val status = TextView(this@MainActivity).apply {
+                    val r = prefs.sourceTest(s.url)
+                    text = when {
+                        testingUrls.contains(s.url) -> "…"
+                        !s.enabled -> "已停用"
+                        r == null -> "未测试"
+                        r.first -> "可用 · ${r.second}ms"
+                        else -> "上次失败"
+                    }
+                    setTextColor(
+                        when {
+                            !s.enabled -> Color.parseColor("#64748b")
+                            r == null -> Color.parseColor("#94a3b8")
+                            r.first -> Color.parseColor("#4ade80")
+                            else -> Color.parseColor("#f87171")
+                        },
+                    )
+                    setTextSize(13f)
+                }
+                row.addView(dot, LinearLayout.LayoutParams(dp(9), dp(9)).apply { rightMargin = dp(14) })
+                row.addView(name)
+                row.addView(domain)
+                row.addView(status)
+                return row
             }
-            col.addView(listView, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         }
+        listView.setOnItemClickListener { _, _, position, _ ->
+            if (position >= rows.size) showLive() else sourceActions(position)
+        }
+        listView.setOnItemLongClickListener { _, _, position, _ ->
+            val list = prefs.sources()
+            if (position in list.indices) {
+                list[position] = list[position].copy(enabled = !list[position].enabled)
+                prefs.saveSources(list)
+                toast(if (list[position].enabled) "已启用「${list[position].name}」" else "已停用「${list[position].name}」")
+                showSources()
+            }
+            true
+        }
+        col.addView(listView, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setScreen(col)
+    }
+
+    /** 全部测试：并发探测启用中的源，结果写回 Prefs 供列表展示 */
+    private fun runAllSourceTests() {
+        val list = prefs.sources().filter { it.enabled }
+        if (list.isEmpty()) {
+            toast("没有启用的片源")
+            return
+        }
+        toast("正在测试 ${list.size} 个片源…")
+        testingUrls.clear()
+        list.forEach { testingUrls.add(it.url) }
+        showSources()
+        scope.launch {
+            var failed = 0
+            for (s in list) {
+                val r = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { api.testSource(s.url) }.getOrNull()
+                }
+                if (r != null) {
+                    prefs.saveSourceTest(s.url, r.first, r.second.toLong())
+                    if (!r.first) failed++
+                }
+                testingUrls.remove(s.url)
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    if (currentScreen == "sources") showSources()
+                }
+            }
+            testingUrls.clear()
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                if (currentScreen == "sources") showSources()
+                toast(if (failed > 0) "测试完成：$failed 个不可用" else "测试完成：全部可用")
+            }
+        }
     }
 
     private fun sourceActions(index: Int) {
@@ -1265,40 +1576,27 @@ class MainActivity : Activity() {
     /** 添加片源：应用内列表（不是弹窗） */
     private fun showAddSource() {
         currentScreen = "addsource"
-        val options: List<Pair<String, () -> Unit>> = listOf(
-            "从 sources.json 粘贴文本" to {
+
+        // 按「最省事 → 最麻烦」排序，每项给一句用途说明
+        val options = listOf(
+            Triple("扫码添加", "手机扫码后在网页里选文件或粘贴", { showQrAdd() }),
+            Triple("粘贴文本", "从电脑复制 sources.json 内容，粘到这里", {
                 inputPage("粘贴 sources.json", "把 sources.json 全文粘到这里", multiline = true) { v ->
                     if (v.isEmpty()) toast("内容为空") else importText(v)
                 }
-            },
-            "从设备文件选择（U 盘 / 下载目录）" to { pickJsonFile() },
-            "从内网网址下载（可用内网地址）" to {
-                inputPage("从网址下载", "http://<你的NAS>:5000/sources.json") { u ->
+            }),
+            Triple("从设备文件选择", "读取 U 盘 / 下载目录里的 .json / .m3u", { pickJsonFile() }),
+            Triple("手动添加采集站", "只添加一个 CMS 接口地址", { showManualAdd() }),
+            Triple("从网址导入", "填 sources.json 或订阅链接", {
+                inputPage("从网址导入", "https://example.com/sources.json") { u ->
                     if (u.isEmpty()) {
                         toast("请填地址")
                     } else {
                         runApi("下载中…", { api.fetchText(u) }, { text -> importText(text) })
                     }
                 }
-            },
-            "从订阅地址导入（必须公网）" to {
-                inputPage("从订阅地址导入", "https://…/sources.json（必须公网）") { u ->
-                    if (u.isEmpty()) {
-                        toast("请填地址")
-                    } else {
-                        runApi("导入中…", { api.importSourceList(u) }, { list ->
-                            if (list.isEmpty()) toast("没有导入到点播源") else {
-                                val added = prefs.addSources(list)
-                                toast("订阅共 ${list.size} 个，新增 $added")
-                                showSources()
-                            }
-                        })
-                    }
-                }
-            },
-            "手动添加采集站" to { showManualAdd() },
-            "从服务器配置导入（DEFAULT_SOURCES）" to { importServerConfig() },
-            "扫码添加（手机扫码后粘贴）" to { showQrAdd() },
+            }),
+            Triple("服务器配置导入", "从 LibreTV 的 DEFAULT_SOURCES 拉取", { importServerConfig() }),
         )
 
         val col = LinearLayout(this).apply {
@@ -1307,11 +1605,41 @@ class MainActivity : Activity() {
         }
         col.addView(brandRow(false))
         col.addView(titleText("添加片源", 20f))
-        col.addView(hintText("选一种方式"))
+        col.addView(hintText("选一种方式，越靠上越省事"))
+
         val listView = newList()
-        bindList(listView, options.map { it.first }, onItem = { idx -> options[idx].second() })
+        listView.adapter = object : BaseAdapter() {
+            override fun getCount(): Int = options.size
+
+            override fun getItem(position: Int): Any = options[position]
+
+            override fun getItemId(position: Int): Long = position.toLong()
+
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val box = (convertView as? LinearLayout) ?: LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(10), dp(14), dp(10), dp(14))
+                }
+                box.removeAllViews()
+                val (title, desc, _) = options[position]
+                box.addView(TextView(this@MainActivity).apply {
+                    text = if (position == 0) "$title   推荐" else title
+                    setTextColor(if (position == 0) ACCENT else TEXT_COLOR)
+                    setTextSize(17f)
+                })
+                box.addView(TextView(this@MainActivity).apply {
+                    text = desc
+                    setTextColor(Color.parseColor("#64748b"))
+                    setTextSize(13f)
+                    setPadding(0, dp(3), 0, 0)
+                })
+                return box
+            }
+        }
+        listView.setOnItemClickListener { _, _, position, _ -> options[position].third() }
         col.addView(listView, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         bar.addView(button("返回片源管理") { showSources() })
         col.addView(hScroll(bar))
@@ -1361,7 +1689,7 @@ class MainActivity : Activity() {
     private fun showQrAdd() {
         currentScreen = "qradd"
         qrServer?.stop()
-        val server = QrAddServer(8765) { text ->
+        val server = QrAddServer(this, 8765) { text ->
             val list = api.parseSourceList(text)
             if (list.isEmpty()) throw IllegalArgumentException("no sources")
             prefs.addSources(list)
@@ -2045,14 +2373,37 @@ class MainActivity : Activity() {
             col.addView(hScroll(row))
         }
 
-        val listView = newList()
-        bindList(listView, 
-            detail.episodes.mapIndexed { i, url -> "第 ${i + 1} 集    " + labelOf(url) },
-            onItem = { idx -> playFromList(detail.episodes, idx, detail.info.title.ifEmpty { item.name }, detail.info.cover.ifEmpty { item.pic }) },
-        )
-        col.addView(listView, LinearLayout.LayoutParams(
+        val epGrid = newGrid().apply {
+            numColumns = 8
+            horizontalSpacing = dp(10)
+            verticalSpacing = dp(10)
+        }
+        epGrid.adapter = object : BaseAdapter() {
+            override fun getCount() = detail.episodes.size
+            override fun getItem(position: Int): Any = position
+            override fun getItemId(position: Int) = position.toLong()
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val tv = (convertView as? TextView) ?: TextView(this@MainActivity).apply {
+                    gravity = Gravity.CENTER
+                    setTextSize(14f)
+                    setTextColor(TEXT_COLOR)
+                    setPadding(dp(6), dp(14), dp(6), dp(14))
+                }
+                // CMS 的集数标题常常带一段哈希（第1集$4ad62e），这里只保留序号
+                tv.text = "第 ${position + 1} 集"
+                return tv
+            }
+        }
+        epGrid.setOnItemClickListener { _, _, position, _ ->
+            playFromList(
+                detail.episodes,
+                position,
+                detail.info.title.ifEmpty { item.name },
+                detail.info.cover.ifEmpty { item.pic },
+            )
+        }
+        col.addView(epGrid, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        col.addView(button("返回片源管理") { showSources() })
 
         setScreen(col)
     }
@@ -2354,7 +2705,16 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(48), dp(24), dp(48), dp(20))
         }
-        col.addView(brandRow())
+        val brandBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        brandBar.addView(
+            brandRow(),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        updateCapsule()?.let { brandBar.addView(it) }
+        col.addView(brandBar)
         col.addView(titleText(
             (when {
                 recommendTag == "综艺" -> "豆瓣 · 综艺"
@@ -2381,6 +2741,7 @@ class MainActivity : Activity() {
             }
         }
         col.addView(hScroll(bar))
+        homeBar = bar
 
         val grid = newGrid().apply {
             numColumns = 6

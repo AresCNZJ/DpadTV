@@ -222,6 +222,24 @@ class Prefs(ctx: Context) {
         get() = sp.getInt("cache_limit_mb", 2048)
         set(v) = sp.edit().putInt("cache_limit_mb", v).apply()
 
+    /** 首页右上角更新提示开关（关闭后只在设置页页脚显示红点） */
+    var updateBannerEnabled: Boolean
+        get() = sp.getBoolean("update_banner", true)
+        set(v) = sp.edit().putBoolean("update_banner", v).apply()
+
+    /** 已经看过详情的版本 tag，用于把胶囊从"未读"变成普通状态 */
+    var updateBannerSeen: String
+        get() = sp.getString("update_banner_seen", "") ?: ""
+        set(v) = sp.edit().putString("update_banner_seen", v).apply()
+
+    /** 最新版本的更新说明与页面地址（首页胶囊点开时展示） */
+    var latestNotes: String
+        get() = sp.getString("latest_notes", "") ?: ""
+        set(v) = sp.edit().putString("latest_notes", v).apply()
+
+    var latestUrl: String
+        get() = sp.getString("latest_url", "") ?: ""
+        set(v) = sp.edit().putString("latest_url", v).apply()
     /** 远端最新 tag（空表示已是最新或还没检查过） */
     var latestTag: String
         get() = sp.getString("latest_tag", "") ?: ""
@@ -250,6 +268,22 @@ class Prefs(ctx: Context) {
         sp.edit().putString("home_bar_order", list.joinToString(",")).apply()
     }
 
+    /** 记录某个源最近一次连通性测试结果（列表直接展示，不用每次重测） */
+    fun saveSourceTest(url: String, ok: Boolean, ms: Long) {
+        val k = "st_ok:" + url.hashCode()
+        sp.edit()
+            .putBoolean(k, ok)
+            .putLong("st_ms:" + url.hashCode(), ms)
+            .putLong("st_at:" + url.hashCode(), System.currentTimeMillis())
+            .apply()
+    }
+
+    /** 最近一次测试结果：null 表示没测过 */
+    fun sourceTest(url: String): Pair<Boolean, Long>? {
+        val k = "st_ok:" + url.hashCode()
+        if (!sp.contains(k)) return null
+        return sp.getBoolean(k, false) to sp.getLong("st_ms:" + url.hashCode(), 0L)
+    }
     /** 首页顶部被隐藏的按钮 id */
     fun homeBarHidden(): Set<String> {
         val text = sp.getString("home_bar_hidden", "") ?: ""
