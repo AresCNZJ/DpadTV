@@ -24,7 +24,6 @@ import androidx.media3.common.Player
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.analytics.PlaybackStatsListener
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -43,7 +42,7 @@ import androidx.media3.ui.PlayerView
  * 选集面板打开时，按键交给网格（方向键选择、OK 跳转、返回关闭）。
  *
  * 片名默认隐藏，只在暂停、操作栏打开、或出错时出现；切集时会短暂闪一下。
- * 缓冲时在「缓冲中…」下面显示实时网速（按累计字节差分计算）。
+ * 缓冲时在「缓冲中…」下面显示实时网速（DataSource 层实测网络吞吐，见 NetSpeed.kt）。
  */
 class PlayerActivity : Activity() {
 
@@ -99,10 +98,8 @@ class PlayerActivity : Activity() {
 
     private val handler = Handler(Looper.getMainLooper())
 
-    /** 网速采样：用累计字节/累计耗时做差分 */
-    private val statsListener = PlaybackStatsListener(false, null)
-    private var lastBytes = 0L
-    private var lastMs = 0L
+    /** 网速实测：统计真正走网络（缓存未命中）的读取吞吐，见 NetSpeed.kt */
+    private val netSpeedMeter = NetSpeedMeter()
 
     private val saveTick = object : Runnable {
         override fun run() {
@@ -121,16 +118,8 @@ class PlayerActivity : Activity() {
     private val speedTick = object : Runnable {
         override fun run() {
             if (!::speedText.isInitialized || speedText.visibility != View.VISIBLE) return
-            val stats = statsListener.playbackStats
-            val bytes = stats?.totalBandwidthBytes ?: 0L
-            val ms = stats?.totalBandwidthTimeMs ?: 0L
-            if (ms > lastMs && bytes >= lastBytes) {
-                val db = bytes - lastBytes
-                val dm = ms - lastMs
-                if (dm > 0) speedText.text = "网速 " + formatSpeed(db * 8000L / dm)
-            }
-            lastBytes = bytes
-            lastMs = ms
+            val bps = netSpeedMeter.bitsPerSecond()
+            speedText.text = if (bps != null) "网速 " + formatSpeed(bps) else "测速中…"
             handler.postDelayed(this, 500)
         }
     }
@@ -418,7 +407,7 @@ class PlayerActivity : Activity() {
             .setReadTimeoutMs(15_000)
         val cacheFactory = androidx.media3.datasource.cache.CacheDataSource.Factory()
             .setCache(PlaybackCache.get(this))
-            .setUpstreamDataSourceFactory(httpFactory)
+            .setUpstreamDataSourceFactory(MeteredDataSource.Factory(httpFactory, netSpeedMeter))
             .setFlags(androidx.media3.datasource.cache.CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
         val mediaSourceFactory =
             androidx.media3.exoplayer.source.DefaultMediaSourceFactory(cacheFactory)
@@ -430,7 +419,6 @@ class PlayerActivity : Activity() {
             .build()
             .also { exo ->
                 playerView.player = exo
-                exo.addAnalyticsListener(statsListener)
                 exo.setPlaybackSpeed(prefs.playbackSpeed)
                 exo.pauseAtEndOfMediaItems = !prefs.autoNext
 
@@ -458,8 +446,6 @@ class PlayerActivity : Activity() {
                         speedText.visibility = if (buffering) View.VISIBLE else View.GONE
                         handler.removeCallbacks(speedTick)
                         if (buffering) {
-                            lastBytes = 0L
-                            lastMs = 0L
                             handler.post(speedTick)
                         }
                         if (playbackState == Player.STATE_ENDED) {
