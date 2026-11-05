@@ -21,8 +21,29 @@ android {
         // 23 = Android 6.0：Media3 的下限之上，老盒子都能装
         minSdk = 23
         targetSdk = 37
-        versionCode = 102
-        versionName = "1.2.0"
+        versionCode = 103
+        versionName = "1.2.1"
+    }
+
+    // release 签名从 local.properties 读（keystore 与密码都不入库）；
+    // 没配置时退回未签名构建，不阻塞流水线
+    val ksPath = localProps.getProperty("dpadtv.keystore")
+    val ksStorePass = localProps.getProperty("dpadtv.storePassword")
+    val ksKeyAlias = localProps.getProperty("dpadtv.keyAlias")
+    val ksKeyPass = localProps.getProperty("dpadtv.keyPassword")
+    val hasSigning = !ksPath.isNullOrBlank() && !ksStorePass.isNullOrBlank() &&
+        !ksKeyAlias.isNullOrBlank() && !ksKeyPass.isNullOrBlank() &&
+        rootProject.file(ksPath).exists()
+
+    signingConfigs {
+        if (hasSigning) {
+            create("release") {
+                storeFile = rootProject.file(ksPath)
+                storePassword = ksStorePass
+                keyAlias = ksKeyAlias
+                keyPassword = ksKeyPass
+            }
+        }
     }
 
     buildTypes {
@@ -30,6 +51,7 @@ android {
             optimization {
                 enable = false
             }
+            if (hasSigning) signingConfig = signingConfigs.getByName("release")
         }
     }
 
