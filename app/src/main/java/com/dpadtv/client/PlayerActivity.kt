@@ -141,10 +141,12 @@ class PlayerActivity : Activity() {
     private val hideUi = Runnable {
         val p = player
         val paused = p != null && !p.playWhenReady && p.playbackState != Player.STATE_IDLE
-        handler.removeCallbacks(uiTick)
         // 暂停时控制条常驻；操作栏/选集中也不隐藏
         if (!paused && !isActionBarVisible() && !pickerVisible) {
             progressRow.visibility = View.GONE
+            // 只有进度条真的收起来，500ms 刷新循环才能停 ——
+            // 暂停时条子常驻，后台还在继续缓冲，secondaryProgress 得跟着长
+            handler.removeCallbacks(uiTick)
         }
         updateChrome()
     }
