@@ -161,8 +161,8 @@ class PlayerActivity : Activity() {
     }
 
     private val hideActions = Runnable {
-        if (isActionBarVisible()) setActionBarVisible(false)
-        updateChrome()
+        // 操作栏到点只收自己；进度条/标题走 collapseToProgress() 再挂 4 秒
+        if (isActionBarVisible()) collapseToProgress()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -766,6 +766,24 @@ class PlayerActivity : Activity() {
         handler.postDelayed(hideActions, HIDE_ACTIONS_DELAY_MS)
     }
 
+    /**
+     * 收起操作栏，控制条退到「只显示进度条」的中间态 —— 也就是按 OK 暂停后那种状态，
+     * 4 秒后由 hideUi 把进度条和标题一起收掉。
+     *
+     * 之前的 bug：菜单键/返回键收起操作栏时只藏了操作栏，而 hideUi 在 showActions()
+     * 里被移除后没人再排上，进度条和标题从此常驻屏幕（6 秒超时路径同样中招）。
+     */
+    private fun collapseToProgress() {
+        setActionBarVisible(false)
+        progressRow.visibility = View.VISIBLE
+        handler.removeCallbacks(hideActions)
+        handler.removeCallbacks(uiTick)
+        handler.post(uiTick)
+        handler.removeCallbacks(hideUi)
+        handler.postDelayed(hideUi, HIDE_UI_DELAY_MS)
+        updateChrome()
+    }
+
     private fun actionButton(label: String, onClick: () -> Unit): TextView = TextView(this).apply {
         text = label
         setTextColor(Ui.TEXT)
@@ -989,12 +1007,12 @@ class PlayerActivity : Activity() {
                     KeyEvent.KEYCODE_MENU,
                     KeyEvent.KEYCODE_M,
                     -> {
-                        hideActions.run()
+                        collapseToProgress()
                         return true
                     }
                     KeyEvent.KEYCODE_DPAD_DOWN -> {
                         // 已经在操作栏上，再按下键就收起
-                        hideActions.run()
+                        collapseToProgress()
                         return true
                     }
                 }
