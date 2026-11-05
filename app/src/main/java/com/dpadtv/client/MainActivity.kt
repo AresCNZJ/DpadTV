@@ -3347,10 +3347,14 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         val hiddenIds = prefs.homeBarHidden()
+        // 老用户存的排序里没有后来新增的页签（比如动漫）：
+        // 按保存的顺序排，缺的默认项补到末尾，保证新页签一定出现
+        val order = prefs.homeBarOrder().filter { HomeBar.DEFAULT.contains(it) }.toMutableList()
+        for (id in HomeBar.DEFAULT) if (!order.contains(id)) order.add(id)
         var toolsDividerAdded = false
-        for (id in prefs.homeBarOrder()) {
+        for (id in order) {
             if (hiddenIds.contains(id)) continue
-            val isCategory = id == "movie" || id == "tv" || id == "show"
+            val isCategory = id == "movie" || id == "tv" || id == "anime" || id == "show"
             // 分类组和工具组之间加一根竖线，视觉上分成两段
             if (!isCategory && !toolsDividerAdded && bar.childCount > 0) {
                 bar.addView(View(this).apply {
@@ -3371,6 +3375,9 @@ class MainActivity : Activity() {
                 "tv" -> bar.addView(navTab("剧集", mediaType == "tv") {
                     switchCategory("tv", "热门")
                 })
+                "anime" -> bar.addView(navTab("动漫", mediaType == "anime") {
+                    switchCategory("anime", "动漫")
+                })
                 "show" -> bar.addView(navTab("综艺", mediaType == "show") {
                     switchCategory("show", "综艺")
                 })
@@ -3390,6 +3397,7 @@ class MainActivity : Activity() {
         // 只保留「这一屏是什么」，去掉原来的「第 N 批 / 共 M 条」——那是调试信息
         val sectionName = when {
             mediaType == "show" -> "豆瓣 · 综艺"
+            mediaType == "anime" -> "豆瓣 · 动漫"
             mediaType == "tv" -> "豆瓣 · $recommendTag · 剧集"
             else -> "豆瓣 · $recommendTag · 电影"
         }

@@ -321,11 +321,12 @@ class Prefs(ctx: Context) {
 }
 
 object HomeBar {
-    val DEFAULT = listOf("movie", "tv", "show", "search", "live", "history", "sources", "setup")
+    val DEFAULT = listOf("movie", "tv", "anime", "show", "search", "live", "history", "sources", "setup")
 
     fun label(id: String): String = when (id) {
         "movie" -> "电影"
         "tv" -> "剧集"
+        "anime" -> "动漫"
         "show" -> "综艺"
         "search" -> "搜索"
         "live" -> "直播"
