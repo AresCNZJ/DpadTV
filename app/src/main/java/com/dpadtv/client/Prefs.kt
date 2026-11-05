@@ -278,6 +278,11 @@ class Prefs(ctx: Context) {
             .apply()
     }
 
+    /** 搜索时只用「测试可用且有结果条目」的源（片源管理 → 更多 里切换） */
+    var searchOnlyAvailable: Boolean
+        get() = sp.getBoolean("search_only_available", false)
+        set(v) = sp.edit().putBoolean("search_only_available", v).apply()
+
     /** 最近一次测试结果：null 表示没测过 */
     fun sourceTest(url: String): Pair<Boolean, Long>? {
         val k = "st_ok:" + url.hashCode()

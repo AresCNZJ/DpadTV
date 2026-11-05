@@ -1424,6 +1424,9 @@ class MainActivity : Activity() {
     private var sourcesAdapter: BaseAdapter? = null
     private var sourcesList: ListView? = null
 
+    /** 顶栏「共 / 启用 / 可用」统计文字。全部测试跑完后原地改文本，避免整页重建 */
+    private var sourcesTail: TextView? = null
+
     /** 重建片源页后要落回去的行号。null = 按默认逻辑聚焦第一个控件（返回键） */
     private var pendingSourceFocus: Int? = null
 
@@ -1742,15 +1745,18 @@ class MainActivity : Activity() {
         // 重建前先清掉旧引用，避免「全部测试」把状态刷到已经不在屏幕上的 adapter 上
         sourcesList = null
         sourcesAdapter = null
-        val enabledCount = sources.count { it.enabled }
+        sourcesTail = null
 
         val col = screen(padH = 40, padV = 20)
         // 返回目标取决于从哪进来的：设置页进来回设置，首页进来回首页
-        col.addView(topBar(
+        val top = topBar(
             "片源管理",
             back = { if (sourcesOrigin == "setup") showSetup() else showRecommend() },
-            tail = if (sources.isEmpty()) "还没有片源" else "$enabledCount / ${sources.size} 启用",
-        ))
+            tail = sourcesTailText(),
+        )
+        col.addView(top)
+        // 统计文字要在「全部测试」结束后原地更新，所以把 tail 那个 TextView 记下来
+        sourcesTail = top.getChildAt(top.childCount - 1) as? TextView
 
         // 只保留两个高频动作（添加 / 全部测试）；「全部启用 / 停用 / 清空」这类批量操作
         // 平时不用、误按代价大，收进「更多」菜单，避免顶部又变回一排等权按钮
@@ -1921,28 +1927,54 @@ class MainActivity : Activity() {
 
     /** 批量操作：平时用不到，但不给入口就只能一个个点 */
     private fun sourceBulkActions() {
-        val actions = arrayOf("全部启用", "全部停用", "从服务器配置同步", "删除全部片源")
+        val onlyAvail = prefs.searchOnlyAvailable
+        val actions = arrayOf(
+            if (onlyAvail) "搜索仅用可用源（当前：开）" else "搜索仅用可用源（当前：关）",
+            "全部启用",
+            "全部停用",
+            "从服务器配置同步",
+            "删除全部片源",
+        )
         AlertDialog.Builder(this)
             .setTitle("片源批量操作")
             .setItems(actions) { _, which ->
                 when (which) {
-                    0, 1 -> {
+                    0 -> {
+                        prefs.searchOnlyAvailable = !onlyAvail
+                        toast(
+                            if (onlyAvail) "已关闭：搜索时用全部启用的源"
+                            else "已开启：搜索时只用「测试可用且有结果」的源",
+                        )
+                        // 重建以刷新顶部的 共/启用/可用 统计
+                        showSources()
+                    }
+                    1, 2 -> {
                         val list = prefs.sources()
                         if (list.isEmpty()) {
                             toast("还没有片源")
                             return@setItems
                         }
-                        val on = which == 0
+                        val on = which == 1
                         prefs.saveSources(list.map { it.copy(enabled = on) })
                         toast(if (on) "已启用全部 ${list.size} 个" else "已停用全部 ${list.size} 个")
                         showSources()
                     }
-                    2 -> importServerConfig()
-                    3 -> confirmDeleteAllSources()
+                    3 -> importServerConfig()
+                    4 -> confirmDeleteAllSources()
                 }
             }
             .setNegativeButton("取消", null)
             .show()
+    }
+
+    /**
+     * 「真实可用」的判定：启用中 + 最近一次连通性测试成功 + 测试时真搜出了条目。
+     * 测试出的条数 > 0 才算 —— 只回包但 0 结果的源，搜索时同样出不了货。
+     */
+    private fun isUsableSource(s: SourceConfig): Boolean {
+        if (!s.enabled) return false
+        val t = prefs.sourceTest(s.url) ?: return false
+        return t.first && t.second > 0
     }
 
     /** 清空全部片源：不可撤销的操作，必须二次确认并说清楚影响范围 */
@@ -2006,10 +2038,24 @@ class MainActivity : Activity() {
     /**
      * 只刷新片源行的状态文字，不重建页面。
      * AbsListView 在 notifyDataSetChanged() 后会保留选中位置和焦点，这正是我们要的。
+     * 顶部统计也一起原地更新 —— 测试结果落库后「可用」数会变。
      */
     private fun refreshSourceRows() {
         if (currentScreen != "sources") return
         sourcesAdapter?.notifyDataSetChanged()
+        sourcesTail?.text = sourcesTailText()
+    }
+
+    /** 片源页顶栏统计：总数 / 启用数 / 真实可用数（+ 开关状态） */
+    private fun sourcesTailText(): String {
+        val sources = prefs.sources()
+        if (sources.isEmpty()) return "还没有片源"
+        val enabled = sources.count { it.enabled }
+        val usable = sources.count { isUsableSource(it) }
+        return buildString {
+            append("共 ${sources.size} · 启用 $enabled · 可用 $usable")
+            if (prefs.searchOnlyAvailable) append(" · 搜索仅用可用")
+        }
     }
 
     private fun sourceActions(index: Int) {
@@ -2625,8 +2671,19 @@ class MainActivity : Activity() {
         if (kw.isEmpty()) { toast("请输入片名"); return }
         // 在搜索页发起 = 返回时回搜索页；在首页点海报发起 = 返回时回首页
         resultsFrom = if (currentScreen == "home") "home" else "recommend"
-        val sources = prefs.sources().filter { it.enabled }
+        var sources = prefs.sources().filter { it.enabled }
         if (sources.isEmpty()) { toast("没有启用的片源，去「片源管理」开启或添加"); showSources(); return }
+        // 「搜索仅用可用源」开关：只搜测试可用且真出过结果的源。
+        // 一个可用源都没有时（比如都还没测试过）不硬卡住，退回全部启用源并提示，
+        // 否则新装用户把开关一开就再也搜不出任何东西
+        if (prefs.searchOnlyAvailable) {
+            val usable = sources.filter { isUsableSource(it) }
+            if (usable.isNotEmpty()) {
+                sources = usable
+            } else {
+                toast("暂无「可用且有结果」的源，本次仍搜全部 ${sources.size} 个启用源")
+            }
+        }
         runApi("正在搜索「$kw」（${sources.size} 个源，可能需要几秒）…", {
             val first = api.search(kw, sources)
             // 兜底：豆瓣条目常带「（2023）」「：副标题」这类噪声，采集站匹配不到时再试一次干净片名
