@@ -459,7 +459,10 @@ class PlayerActivity : Activity() {
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
                         updatePlayPauseIcon()
                         updateChrome()
-                        if (!isPlaying) showProgress()
+                        // 缓冲时 isPlaying 同样会变 false：那种时刻只要中央的转圈 + 网速，
+                        // 不要把进度条和标题也拉起来。只有用户主动暂停才展示控制条。
+                        val pausedByUser = player?.playWhenReady == false
+                        if (!isPlaying && pausedByUser) showProgress()
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
