@@ -3284,7 +3284,8 @@ class MainActivity : Activity() {
     }
 
     /** 单集播放（直播频道、观看历史都用这个） */
-    private fun play(url: String, title: String) = playFromList(listOf(url), 0, title)
+    private fun play(url: String, title: String, isLive: Boolean = false) =
+        playFromList(listOf(url), 0, title, isLive = isLive)
 
     /** 整季播放：把整个集数列表交给播放器，一集放完自动进下一集 */
     private fun playFromList(
@@ -3293,6 +3294,7 @@ class MainActivity : Activity() {
         title: String,
         cover: String = "",
         fromStart: Boolean = false,
+        isLive: Boolean = false,
     ) {
         if (urls.isEmpty()) return
         startActivity(Intent(this, PlayerActivity::class.java).apply {
@@ -3302,6 +3304,7 @@ class MainActivity : Activity() {
             putExtra(PlayerActivity.EXTRA_COVER, cover)
             // 「从头播放」要忽略续播记录，否则点它会接着上次的位置放
             putExtra(PlayerActivity.EXTRA_FROM_START, fromStart)
+            putExtra(PlayerActivity.EXTRA_IS_LIVE, isLive)
         })
     }
 
@@ -3429,7 +3432,7 @@ class MainActivity : Activity() {
                 }
                 val ch = liveSorted[position]
                 tv.text = liveRowLabel(ch)
-                tv.setOnClickListener { play(ch.url, ch.name) }
+                tv.setOnClickListener { play(ch.url, ch.name, isLive = true) }
                 applyFocusStyle(tv, Color.TRANSPARENT, tv)
                 return tv
             }
@@ -3449,7 +3452,7 @@ class MainActivity : Activity() {
         }
         listView.setOnItemClickListener { _, _, position, _ ->
             val ch = liveSorted.getOrNull(position) ?: return@setOnItemClickListener
-            play(ch.url, ch.name)
+            play(ch.url, ch.name, isLive = true)
         }
         listView.setOnKeyListener { v, keyCode, event ->
             if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
@@ -3461,7 +3464,7 @@ class MainActivity : Activity() {
                 // 有些遥控器的 OK 不走 onItemClick，这里兜一下
                 isOk -> {
                     val ch = liveSorted.getOrNull(pos) ?: return@setOnKeyListener false
-                    play(ch.url, ch.name)
+                    play(ch.url, ch.name, isLive = true)
                     true
                 }
                 keyCode == KeyEvent.KEYCODE_DPAD_RIGHT -> {

@@ -57,6 +57,9 @@ class PlayerActivity : Activity() {
         /** 「从头播放」：忽略续播记录，从 0 开始 */
         const val EXTRA_FROM_START = "from_start"
 
+        /** 直播频道：不走磁盘缓存，出错自动重连 */
+        const val EXTRA_IS_LIVE = "is_live"
+
         private const val SAVE_INTERVAL_MS = 5_000L
         private const val HIDE_UI_DELAY_MS = 4_000L
         private const val HIDE_ACTIONS_DELAY_MS = 6_000L
@@ -93,6 +96,9 @@ class PlayerActivity : Activity() {
     private var hasError = false
     private var aspectMode = 0
     private var fromStart = false
+    private var isLive = false
+    /** 直播流断流后自动重连的次数，连上就清零 */
+    private var liveRetry = 0
     private var seekStepMs = 15_000L
     private var pickerVisible = false
 
@@ -167,6 +173,7 @@ class PlayerActivity : Activity() {
         seriesTitle = intent.getStringExtra(EXTRA_TITLE).orEmpty()
         coverUrl = intent.getStringExtra(EXTRA_COVER).orEmpty()
         fromStart = intent.getBooleanExtra(EXTRA_FROM_START, false)
+        isLive = intent.getBooleanExtra(EXTRA_IS_LIVE, false)
         seekStepMs = prefs.seekStepSeconds.coerceIn(5, 120) * 1000L
 
         val root = FrameLayout(this)
@@ -411,14 +418,17 @@ class PlayerActivity : Activity() {
         // 分片级磁盘缓存：看过的片段落盘，回拖/重看不再重复下载
         val httpFactory = androidx.media3.datasource.DefaultHttpDataSource.Factory()
             .setUserAgent("DpadTV-Android")
-            .setConnectTimeoutMs(15_000)
-            .setReadTimeoutMs(15_000)
+            .setConnectTimeoutMs(if (isLive) 20_000 else 15_000)
+            .setReadTimeoutMs(if (isLive) 30_000 else 15_000)
         val cacheFactory = androidx.media3.datasource.cache.CacheDataSource.Factory()
             .setCache(PlaybackCache.get(this))
             .setUpstreamDataSourceFactory(MeteredDataSource.Factory(httpFactory, netSpeedMeter))
             .setFlags(androidx.media3.datasource.cache.CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-        val mediaSourceFactory =
-            androidx.media3.exoplayer.source.DefaultMediaSourceFactory(cacheFactory)
+        // 直播不挂磁盘缓存：直播分片写进缓存既没用，分片被回收/304 时还会抛 IO 错，
+        // 表现出来就是正在看的时候突然 ERROR_CODE_IO_UNSPECIFIED
+        val mediaSourceFactory = androidx.media3.exoplayer.source.DefaultMediaSourceFactory(
+            if (isLive) MeteredDataSource.Factory(httpFactory, netSpeedMeter) else cacheFactory,
+        )
 
         player = ExoPlayer.Builder(this)
             .setLoadControl(loadControl)
@@ -449,6 +459,7 @@ class PlayerActivity : Activity() {
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
+                        if (playbackState == Player.STATE_READY) liveRetry = 0
                         val buffering = playbackState == Player.STATE_BUFFERING
                         bufferingBox.visibility = if (buffering) View.VISIBLE else View.GONE
                         speedText.visibility = if (buffering) View.VISIBLE else View.GONE
@@ -474,6 +485,19 @@ class PlayerActivity : Activity() {
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
+                        // 直播断流很常见（分片 404、切片边缘、临时网络抖动）：先自动重连几次，
+                        // 别一上来就盖一层「播放失败」的红字
+                        if (isLive && error.errorCodeName.contains("ERROR_CODE_IO") && liveRetry < 3) {
+                            liveRetry++
+                            toast("直播流中断，正在重连（$liveRetry/3）…")
+                            handler.postDelayed({
+                                val p = player ?: return@postDelayed
+                                p.setMediaItem(MediaItem.fromUri(currentUrl()))
+                                p.prepare()
+                                p.playWhenReady = true
+                            }, 1200L * liveRetry)
+                            return
+                        }
                         val msg = if (error.errorCodeName.contains("DECODER", true)) {
                             "解码失败：这个片源可能是 H.265 / 不支持的编码"
                         } else {
