@@ -420,6 +420,9 @@ class PlayerActivity : Activity() {
             .setUserAgent("DpadTV-Android")
             .setConnectTimeoutMs(if (isLive) 20_000 else 15_000)
             .setReadTimeoutMs(if (isLive) 30_000 else 15_000)
+            // 直播地址大量存在 http→https 的 302 跳转，Media3 默认禁止跨协议重定向，
+            // 被拒绝时抛的就是 ERROR_CODE_IO_UNSPECIFIED —— 这是这个错误最常见的一种来源
+            .setAllowCrossProtocolRedirects(true)
         val cacheFactory = androidx.media3.datasource.cache.CacheDataSource.Factory()
             .setCache(PlaybackCache.get(this))
             .setUpstreamDataSourceFactory(MeteredDataSource.Factory(httpFactory, netSpeedMeter))
@@ -487,21 +490,28 @@ class PlayerActivity : Activity() {
                     override fun onPlayerError(error: PlaybackException) {
                         // 直播断流很常见（分片 404、切片边缘、临时网络抖动）：先自动重连几次，
                         // 别一上来就盖一层「播放失败」的红字
-                        if (isLive && error.errorCodeName.contains("ERROR_CODE_IO") && liveRetry < 3) {
+                        // 直播断流很常见（分片 404、切片边缘、临时抖动）：
+                        // 前三次失败先静默重连，之后每次提示一下，最多 8 次；
+                        // 只有非 IO 类错误（解码失败等）才立刻报错
+                        if (isLive && error.errorCodeName.contains("ERROR_CODE_IO") && liveRetry < 8) {
                             liveRetry++
-                            toast("直播流中断，正在重连（$liveRetry/3）…")
+                            if (liveRetry >= 2) toast("直播流中断，正在重连（$liveRetry/8）…")
+                            val delay = (800L * liveRetry).coerceAtMost(5_000L)
                             handler.postDelayed({
                                 val p = player ?: return@postDelayed
                                 p.setMediaItem(MediaItem.fromUri(currentUrl()))
                                 p.prepare()
                                 p.playWhenReady = true
-                            }, 1200L * liveRetry)
+                            }, delay)
                             return
                         }
-                        val msg = if (error.errorCodeName.contains("DECODER", true)) {
-                            "解码失败：这个片源可能是 H.265 / 不支持的编码"
-                        } else {
-                            "播放失败：${error.errorCodeName}"
+                        val msg = when {
+                            error.errorCodeName.contains("DECODER", true) ->
+                                "解码失败：这个片源可能是 H.265 / 不支持的编码"
+                            // 直播重试 8 次都连不上，基本就是台挂了/被地区限制，别甩错误码给用户
+                            isLive ->
+                                "这个频道连不上（已重连 8 次）· 按返回键换个台"
+                            else -> "播放失败：${error.errorCodeName}"
                         }
                         hasError = true
                         baseText = "$msg  ·  按菜单键换集或换源"
