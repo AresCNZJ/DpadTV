@@ -2303,12 +2303,25 @@ class MainActivity : Activity() {
                 }
             },
             AddOption("从设备文件选择", "读取 U 盘 / 下载目录里的 .json / .m3u") { pickJsonFile() },
-            AddOption("从网址导入", "填 sources.json 或订阅链接") {
+            AddOption("从网址导入", "sources.json、订阅链接或 M3U") {
                 inputPage("从网址导入", "https://example.com/sources.json") { u ->
                     if (u.isEmpty()) {
                         toast("请填地址")
                     } else {
-                        runApi("下载中…", { api.fetchText(u) }, { text -> importText(text) })
+                        // 先让服务端代拉并解析：订阅地址（返回源列表 JSON）走这条路最稳，
+                        // 电视自己拉 gist / GitHub 经常连不上。拉不动再退回本地下载原文解析。
+                        runApi("下载中…", {
+                            val parsed = runCatching { api.importSourceList(u) }.getOrDefault(emptyList())
+                            parsed to (if (parsed.isEmpty()) api.fetchText(u) else "")
+                        }, { (parsed, raw) ->
+                            if (parsed.isNotEmpty()) {
+                                val added = prefs.addSources(parsed)
+                                toast("导入 ${parsed.size} 个片源（新增 $added）")
+                                showSources()
+                            } else {
+                                importText(raw)
+                            }
+                        })
                     }
                 }
             },
@@ -2554,14 +2567,72 @@ class MainActivity : Activity() {
             st to subs
         }, { (st, subs) ->
             val all = st.defaultSources + subs
-            if (all.isEmpty()) {
-                toast("服务器没配 DEFAULT_SOURCES / DEFAULT_SUBSCRIPTIONS")
-            } else {
-                val added = prefs.addSources(all)
-                toast("服务器共 ${all.size} 个，新增 $added")
-                showSources()
+            val added = if (all.isEmpty()) 0 else prefs.addSources(all)
+
+            // 直播源（M3U 订阅）是另一套数据，服务器配了 DEFAULT_LIVE_SOURCES 也要一起带过来，
+            // 否则同步完片源有了、直播页还是空的
+            var liveAdded = 0
+            if (st.defaultLiveSources.isNotEmpty()) {
+                val cur = prefs.liveUrls()
+                st.defaultLiveSources.forEach { u ->
+                    if (!cur.contains(u)) {
+                        cur.add(u)
+                        liveAdded++
+                    }
+                }
+                prefs.saveLiveUrls(cur)
+                if (prefs.activeLiveUrl.isEmpty()) prefs.activeLiveUrl = cur.firstOrNull().orEmpty()
             }
+
+            if (all.isEmpty() && st.defaultLiveSources.isEmpty()) {
+                toast("服务器没配 DEFAULT_SOURCES / DEFAULT_SUBSCRIPTIONS / DEFAULT_LIVE_SOURCES")
+                return@runApi
+            }
+            val parts = mutableListOf<String>()
+            if (all.isNotEmpty()) parts.add("片源 ${all.size} 个（新增 $added）")
+            if (st.defaultLiveSources.isNotEmpty()) parts.add("直播源 ${st.defaultLiveSources.size} 个（新增 $liveAdded）")
+            toast(parts.joinToString("，"))
+            liveChannels = emptyList()
+            liveChannelSource = ""
+            showSources()
         })
+    }
+
+    /** 直播源删除：列出已添加的 M3U 订阅，选一个确认后删掉 */
+    private fun removeLiveSourceDialog() {
+        val urls = prefs.liveUrls()
+        if (urls.isEmpty()) {
+            toast("还没有直播源")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("删除直播源")
+            .setItems(urls.toTypedArray()) { _, which -> confirmRemoveLiveSource(urls[which]) }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun confirmRemoveLiveSource(url: String) {
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("删除这个直播源？")
+            .setMessage(url)
+            .setPositiveButton("删除") { _, _ ->
+                val left = prefs.liveUrls().filter { it != url }
+                prefs.saveLiveUrls(left)
+                if (prefs.activeLiveUrl == url) prefs.activeLiveUrl = left.firstOrNull().orEmpty()
+                liveChannels = emptyList()
+                liveChannelSource = ""
+                toast(if (left.isEmpty()) "已删除，没有直播源了" else "已删除")
+                if (left.isEmpty()) addLiveDialog() else showLive()
+            }
+            .setNegativeButton("取消", null)
+            .create()
+        // 遥控器上 AlertDialog 的按钮默认没有焦点，不主动 requestFocus 的话按 OK 毫无反应，
+        // 必须先按一次方向键才能选中 —— 删除这种确认框尤其容易被当成「删不掉」
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.requestFocus()
+        }
+        dialog.show()
     }
     /* ------------------------------------------------- 搜索结果（卡片网格） */
 
@@ -3240,6 +3311,7 @@ class MainActivity : Activity() {
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         bar.addView(button("换源") { pickLiveSource() })
         bar.addView(button("添加直播源") { addLiveDialog() })
+        bar.addView(button("删除") { removeLiveSourceDialog() })
         bar.addView(
             button(if (liveGroupFilter.isEmpty()) "分组" else "分组：" + liveGroupFilter.take(10)) {
                 val groups = listOf("全部分组") + liveChannels.map { it.group }.distinct().sorted()
