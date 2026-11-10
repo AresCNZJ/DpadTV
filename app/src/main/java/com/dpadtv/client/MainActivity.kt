@@ -1374,8 +1374,7 @@ class MainActivity : Activity() {
     /** 首页顶部按钮排序：上移 / 下移 / 恢复默认，改完立刻写回并重绘首页 */
     private fun showHomeBarSettings() {
         currentScreen = "homebar"
-        val order = prefs.homeBarOrder().filter { HomeBar.DEFAULT.contains(it) }.toMutableList()
-        for (id in HomeBar.DEFAULT) if (!order.contains(id)) order.add(id)
+        val order = HomeBar.merge(prefs.homeBarOrder())
         val hidden = prefs.homeBarHidden().toMutableSet()
 
         val col = LinearLayout(this).apply {
@@ -3816,10 +3815,9 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         val hiddenIds = prefs.homeBarHidden()
-        // 老用户存的排序里没有后来新增的页签（比如动漫）：
-        // 按保存的顺序排，缺的默认项补到末尾，保证新页签一定出现
-        val order = prefs.homeBarOrder().filter { HomeBar.DEFAULT.contains(it) }.toMutableList()
-        for (id in HomeBar.DEFAULT) if (!order.contains(id)) order.add(id)
+        // 老用户存的排序里没有后来新增的页签（比如动漫）：按默认顺序插回它该在的位置，
+        // 不能直接补到末尾（那会变成「设置 动漫」这种怪顺序）
+        val order = HomeBar.merge(prefs.homeBarOrder())
         var toolsDividerAdded = false
         for (id in order) {
             if (hiddenIds.contains(id)) continue

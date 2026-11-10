@@ -376,6 +376,23 @@ class Prefs(ctx: Context) {
 object HomeBar {
     val DEFAULT = listOf("movie", "tv", "anime", "show", "search", "live", "history", "sources", "setup")
 
+    /**
+     * 把存下来的顺序和默认顺序合并。
+     *
+     * 老版本存过的顺序里没有后来新增的页签（1.3.0 加的「动漫」就是这种情况），
+     * 如果直接补到末尾，升级上来的用户会看到「动漫」跑到「设置」后面去。
+     * 这里按默认顺序找它前面最近的一个仍在列表里的按钮，插到那个按钮后面。
+     */
+    fun merge(saved: List<String>): MutableList<String> {
+        val out = saved.filter { DEFAULT.contains(it) }.toMutableList()
+        DEFAULT.forEachIndexed { idx, id ->
+            if (out.contains(id)) return@forEachIndexed
+            val anchor = DEFAULT.take(idx).lastOrNull { out.contains(it) }
+            out.add(if (anchor == null) 0 else out.indexOf(anchor) + 1, id)
+        }
+        return out
+    }
+
     fun label(id: String): String = when (id) {
         "movie" -> "电影"
         "tv" -> "剧集"
