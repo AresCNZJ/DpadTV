@@ -2654,8 +2654,7 @@ class MainActivity : Activity() {
                 val left = prefs.liveUrls().filter { it != url }
                 prefs.saveLiveUrls(left)
                 if (prefs.activeLiveUrl == url) prefs.activeLiveUrl = left.firstOrNull().orEmpty()
-                liveChannels = emptyList()
-                liveChannelSource = ""
+                resetLiveFilters()
                 toast(if (left.isEmpty()) "已删除，没有直播源了" else "已删除")
                 if (left.isEmpty()) addLiveDialog() else showLive()
             }
@@ -3333,6 +3332,9 @@ class MainActivity : Activity() {
         }
 
         if (liveChannelSource != active || liveChannels.isEmpty()) {
+            // 源变了（或首次进入）就清掉上一次的分组/可用筛选，否则可能筛出空列表
+            liveGroupFilter = ""
+            liveOnlyAlive = false
             runApi("正在加载频道…", { api.liveChannels(active) }, { list ->
                 liveChannels = list
                 liveChannelSource = active
@@ -3395,8 +3397,13 @@ class MainActivity : Activity() {
         bar.addView(button("测活") { probeLiveChannels(liveShown) })
         if (!liveShowFavorites) {
             bar.addView(button(if (liveOnlyAlive) "只看可用 ✓" else "只看可用") {
-                liveOnlyAlive = !liveOnlyAlive
-                showLive()
+                if (!liveOnlyAlive && liveProbeResult.isEmpty()) {
+                    // 还没测过就开筛选只会得到空列表，先提示去测活
+                    toast("还没有测活结果，先点「测活」")
+                } else {
+                    liveOnlyAlive = !liveOnlyAlive
+                    showLive()
+                }
             })
         }
         col.addView(hScroll(bar))
@@ -3515,6 +3522,15 @@ class MainActivity : Activity() {
     private fun favoritesAsChannels(): List<Channel> =
         prefs.favorites().map { Channel(it.name, it.url, it.group.ifEmpty { "收藏" }, "") }
 
+    /** 换源时把「分组筛选」和「只看可用」一起清掉，否则新源里可能一个都筛不出来 */
+    private fun resetLiveFilters() {
+        liveGroupFilter = ""
+        liveOnlyAlive = false
+        liveProbeResult.clear()
+        liveChannels = emptyList()
+        liveChannelSource = ""
+    }
+
     /** 当前源的分组信息是否可用：全都空或全是一个「其他」就说明 m3u 里没带分组 */
     private fun hasUsableGroups(): Boolean =
         liveChannels.map { it.group.trim() }.filter { it.isNotEmpty() && it != "其他" }.distinct().size > 1
@@ -3579,9 +3595,7 @@ class MainActivity : Activity() {
             .setTitle("选择直播源")
             .setItems(sources.map { it.label }.toTypedArray()) { _, which ->
                 prefs.activeLiveUrl = sources[which].url
-                liveChannels = emptyList()
-                liveChannelSource = ""
-                liveProbeResult.clear()
+                resetLiveFilters()
                 showLive()
             }
             .setPositiveButton("添加新的", { _, _ -> addLiveDialog() })
@@ -3609,9 +3623,7 @@ class MainActivity : Activity() {
                 if (list.none { it.url == u }) list.add(LiveSource(name, u))
                 prefs.saveLiveSources(list)
                 prefs.activeLiveUrl = u
-                liveChannels = emptyList()
-                liveChannelSource = ""
-                liveProbeResult.clear()
+                resetLiveFilters()
                 showLive()
             }
             .setNegativeButton("取消", null)
