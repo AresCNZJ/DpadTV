@@ -317,6 +317,36 @@ class Api(baseUrl: String) {
     fun importSourceList(subscriptionUrl: String): List<SourceConfig> =
         parseSourceList(readBody(open("/api/source-list?url=" + enc(subscriptionUrl))))
 
+    /**
+     * 订阅里可能同时带片源和直播源：LibreTV 订阅 JSON 的 liveSources、网页版导出的
+     * liveSubscriptions / liveSelectedUrls 都是这个意思。一次请求把两者都取回来，
+     * 免得「同步完片源有了、直播页还是空的」。
+     */
+    fun importSubscription(url: String): Pair<List<SourceConfig>, List<String>> {
+        val text = readBody(open("/api/source-list?url=" + enc(url)))
+        return parseSourceList(text) to parseLiveUrls(text)
+    }
+
+    /** 从一份订阅/导出 JSON 里抠出全部直播源地址（多种字段形状） */
+    fun parseLiveUrls(text: String): List<String> {
+        val out = LinkedHashSet<String>()
+        runCatching {
+            val root = JSONObject(text)
+            for (key in listOf("liveSources", "liveSubscriptions", "lives")) {
+                val arr = root.optJSONArray(key) ?: continue
+                for (i in 0 until arr.length()) {
+                    when (val v = arr.opt(i)) {
+                        is String -> if (v.isNotEmpty()) out.add(v)
+                        is JSONObject -> v.optString("url", "").takeIf { it.isNotEmpty() }?.let(out::add)
+                    }
+                }
+            }
+        }
+        // 网页版导出的 liveSelectedUrls 走原解析器
+        out.addAll(parseLiveFromExport(text))
+        return out.toList()
+    }
+
     /** 本地解析。兼容三种格式：网页版导出（LibreTV-Settings）、LibreTV-SourceList、TVBOX 配置。 */
     fun parseSourceList(text: String): List<SourceConfig> {
         exportSources(text)?.let { return it }

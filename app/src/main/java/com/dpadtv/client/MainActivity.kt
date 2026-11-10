@@ -986,7 +986,7 @@ class MainActivity : Activity() {
      */
     private fun importText(text: String) {
         val sources = api.parseSourceList(text)
-        val lives = api.parseLiveFromExport(text)
+        val lives = api.parseLiveUrls(text)
         if (sources.isEmpty() && lives.isEmpty()) {
             toast("没解析出片源。支持：网页版导出的 LibreTV-Settings_*.json、SourceList JSON、TVBOX 配置")
             return
@@ -2561,20 +2561,23 @@ class MainActivity : Activity() {
     private fun importServerConfig() {
         runApi("读取服务器配置…", {
             val st = api.status()
-            val subs = st.defaultSubscriptions.flatMap { u ->
-                runCatching { api.importSourceList(u) }.getOrDefault(emptyList())
+            // 订阅里通常同时带片源和直播源，一起取回来
+            val pairs = st.defaultSubscriptions.map { u ->
+                runCatching { api.importSubscription(u) }
+                    .getOrDefault(emptyList<SourceConfig>() to emptyList())
             }
-            st to subs
-        }, { (st, subs) ->
+            val subs = pairs.flatMap { it.first }
+            // 直播源有两个来源：服务端直接配的 DEFAULT_LIVE_SOURCES + 订阅文件里的 liveSources
+            val subLives = pairs.flatMap { it.second }
+            Triple(st, subs, (st.defaultLiveSources + subLives).distinct())
+        }, { (st, subs, lives) ->
             val all = st.defaultSources + subs
             val added = if (all.isEmpty()) 0 else prefs.addSources(all)
 
-            // 直播源（M3U 订阅）是另一套数据，服务器配了 DEFAULT_LIVE_SOURCES 也要一起带过来，
-            // 否则同步完片源有了、直播页还是空的
             var liveAdded = 0
-            if (st.defaultLiveSources.isNotEmpty()) {
+            if (lives.isNotEmpty()) {
                 val cur = prefs.liveUrls()
-                st.defaultLiveSources.forEach { u ->
+                lives.forEach { u ->
                     if (!cur.contains(u)) {
                         cur.add(u)
                         liveAdded++
@@ -2584,13 +2587,13 @@ class MainActivity : Activity() {
                 if (prefs.activeLiveUrl.isEmpty()) prefs.activeLiveUrl = cur.firstOrNull().orEmpty()
             }
 
-            if (all.isEmpty() && st.defaultLiveSources.isEmpty()) {
+            if (all.isEmpty() && lives.isEmpty()) {
                 toast("服务器没配 DEFAULT_SOURCES / DEFAULT_SUBSCRIPTIONS / DEFAULT_LIVE_SOURCES")
                 return@runApi
             }
             val parts = mutableListOf<String>()
             if (all.isNotEmpty()) parts.add("片源 ${all.size} 个（新增 $added）")
-            if (st.defaultLiveSources.isNotEmpty()) parts.add("直播源 ${st.defaultLiveSources.size} 个（新增 $liveAdded）")
+            if (lives.isNotEmpty()) parts.add("直播源 ${lives.size} 个（新增 $liveAdded）")
             toast(parts.joinToString("，"))
             liveChannels = emptyList()
             liveChannelSource = ""
