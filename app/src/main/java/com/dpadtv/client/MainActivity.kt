@@ -114,8 +114,9 @@ class MainActivity : Activity() {
         focusScale: Float = 1.03f,
         inset: Int = 3,
         focusedOutline: Int = ACCENT,
+        radiusDp: Int = Ui.R_BTN,
     ) {
-        val radius = Ui.R_BTN
+        val radius = radiusDp
         val normal = InsetDrawable(
             GradientDrawable().apply {
                 setColor(normalBg)
@@ -493,19 +494,35 @@ class MainActivity : Activity() {
     }
 
     /** 卡片容器：比页面底色亮一档 + 1dp 描边，把一组设置项包成一个整体 */
+    /**
+     * 分组卡片：圆角面板 + 1dp 描边，里面放若干 settingRow。
+     *
+     * 描边画在**前景层**（foreground），不画在背景里：行是铺满的矩形，画在背景上的描边
+     * 会被行整段盖住，只从行与行之间的 1dp 缝里露出一个孤立竖点（就是之前那条「短白条」）。
+     * 画在前景则永远压在子 View 之上，整圈描边稳定可见。
+     *
+     * 圆角交给 clipToOutline 裁，行本身用直角（radiusDp = 0）：否则行自己再画一遍圆弧，
+     * 会和卡片圆弧错开 1dp，看着就是「转角虚化」。
+     */
     private fun card(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        background = Ui.bg(this@MainActivity, Ui.SURFACE, Ui.R_CARD, 0, 1, Ui.STROKE)
+        background = Ui.bg(this@MainActivity, Ui.SURFACE, Ui.R_CARD)
+        clipToOutline = true
+        foreground = Ui.bg(this@MainActivity, android.graphics.Color.TRANSPARENT, Ui.R_CARD, 0, 1, Ui.STROKE)
     }
 
+    /**
+     * 卡片内的行间分隔线。
+     *
+     * 不要左右内缩：内缩后线两头会和卡片描边之间空出 20dp，那截被孤立的竖边
+     * 在暗底上看着就像「两端各贴了一个短白条」。通到卡片边缘后是一条完整的线，
+     * 和卡片边框接成 T 形，视觉上才连续。
+     */
     private fun divider(): View = View(this).apply {
         setBackgroundColor(Ui.STROKE)
         layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(1),
-        ).apply {
-            leftMargin = dp(20)
-            rightMargin = dp(20)
-        }
+        )
     }
 
     /**
@@ -550,7 +567,9 @@ class MainActivity : Activity() {
             setTextSize(20f)
             setTextColor(Ui.TEXT_FAINT)
         })
-        applyFocusStyle(this, Ui.SURFACE, null, focusScale = 1f, inset = 0)
+        // 行的圆角必须和卡片一致（Ui.R_CARD）：不一样的话卡片弧和行弧错开，
+        // 聚焦时外面一圈圆角、里面一圈直角，看着就是「焦点态把圆角弄没了」。
+        applyFocusStyle(this, Ui.SURFACE, null, focusScale = 1f, inset = 0, radiusDp = Ui.R_CARD)
     }
 
     /** 分类页签：选中态是实心强调色，一眼能看出「现在看的是哪一类」 */
