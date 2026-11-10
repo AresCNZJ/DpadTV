@@ -60,6 +60,9 @@ class PlayerActivity : Activity() {
         /** 直播频道：不走磁盘缓存，出错自动重连 */
         const val EXTRA_IS_LIVE = "is_live"
 
+        /** 直播走服务端代理时要带的会话 cookie */
+        const val EXTRA_COOKIE = "cookie"
+
         private const val SAVE_INTERVAL_MS = 5_000L
         private const val HIDE_UI_DELAY_MS = 4_000L
         private const val HIDE_ACTIONS_DELAY_MS = 6_000L
@@ -99,6 +102,7 @@ class PlayerActivity : Activity() {
     private var isLive = false
     /** 直播流断流后自动重连的次数，连上就清零 */
     private var liveRetry = 0
+    private var cookieHeader = ""
     private var seekStepMs = 15_000L
     private var pickerVisible = false
 
@@ -174,6 +178,7 @@ class PlayerActivity : Activity() {
         coverUrl = intent.getStringExtra(EXTRA_COVER).orEmpty()
         fromStart = intent.getBooleanExtra(EXTRA_FROM_START, false)
         isLive = intent.getBooleanExtra(EXTRA_IS_LIVE, false)
+        cookieHeader = intent.getStringExtra(EXTRA_COOKIE).orEmpty()
         seekStepMs = prefs.seekStepSeconds.coerceIn(5, 120) * 1000L
 
         val root = FrameLayout(this)
@@ -423,6 +428,12 @@ class PlayerActivity : Activity() {
             // 直播地址大量存在 http→https 的 302 跳转，Media3 默认禁止跨协议重定向，
             // 被拒绝时抛的就是 ERROR_CODE_IO_UNSPECIFIED —— 这是这个错误最常见的一种来源
             .setAllowCrossProtocolRedirects(true)
+            .apply {
+                // 直播分片走 /api/proxy，需要会话 cookie
+                if (cookieHeader.isNotEmpty()) {
+                    setDefaultRequestProperties(mapOf("Cookie" to cookieHeader))
+                }
+            }
         val cacheFactory = androidx.media3.datasource.cache.CacheDataSource.Factory()
             .setCache(PlaybackCache.get(this))
             .setUpstreamDataSourceFactory(MeteredDataSource.Factory(httpFactory, netSpeedMeter))
@@ -499,7 +510,7 @@ class PlayerActivity : Activity() {
                             val delay = (800L * liveRetry).coerceAtMost(5_000L)
                             handler.postDelayed({
                                 val p = player ?: return@postDelayed
-                                p.setMediaItem(MediaItem.fromUri(currentUrl()))
+                                p.setMediaItem(liveItem(currentUrl()))
                                 p.prepare()
                                 p.playWhenReady = true
                             }, delay)
@@ -525,10 +536,11 @@ class PlayerActivity : Activity() {
                     }
                 })
 
-                val items = urls.map { MediaItem.fromUri(it) }
+                val items = urls.map { liveItem(it) }
                 // 「从头播放」要真的从头：清掉这一集的历史进度，否则下次还会续播
                 if (fromStart) prefs.clearProgress(currentUrl())
-                val resume = if (prefs.resumeEnabled && !fromStart) prefs.progressOf(currentUrl()) else 0L
+                // 直播没有「上次位置」这回事，别弹「从上次位置继续」
+                val resume = if (!isLive && prefs.resumeEnabled && !fromStart) prefs.progressOf(currentUrl()) else 0L
                 val threshold = prefs.resumeThresholdSeconds * 1000L
                 exo.setMediaItems(items, currentIndex, if (resume > threshold) resume else 0L)
                 exo.prepare()
@@ -960,6 +972,17 @@ class PlayerActivity : Activity() {
         handler.postDelayed(hideSeekHint, 900L)
     }
 
+    /**
+     * 构造播放条目。直播必须显式声明是 HLS：
+     * 直播走 /api/proxy?url=... 之后地址里没有 .m3u8 后缀，ExoPlayer 判断不出格式，
+     * 会当普通文件去解，报 UnrecognizedInputFormatException（表现就是一播就"流中断"）。
+     */
+    private fun liveItem(url: String): MediaItem {
+        val builder = MediaItem.Builder().setUri(url)
+        if (isLive) builder.setMimeType(androidx.media3.common.MimeTypes.APPLICATION_M3U8)
+        return builder.build()
+    }
+
     private fun currentUrl(): String = urls.getOrNull(currentIndex).orEmpty()
 
     private fun labelFor(index: Int): String {
@@ -968,6 +991,8 @@ class PlayerActivity : Activity() {
     }
 
     private fun persistProgress() {
+        // 直播不记进度/历史：位置对直播没有意义，还会让下次进来续播
+        if (isLive) return
         val p = player ?: return
         if (p.isPlaying || p.playbackState == Player.STATE_READY) {
             val url = currentUrl()

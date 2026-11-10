@@ -483,5 +483,15 @@ class Api(baseUrl: String) {
         }
     }
 
+    /** 当前会话 cookie，直播走代理时播放器要带上 */
+    val sessionCookie: String get() = cookie.orEmpty()
+
+    /**
+     * 把任意地址包成服务端代理地址。直播必须走这条：
+     * 网页版之所以能看地方台，就是所有分片都由服务端代取（返回的播放列表里分片地址
+     * 已经被改写成 /api/proxy?url=...），App 直连这些台会被地区限制或直接断开。
+     */
+    fun proxyUrl(url: String): String = "$baseUrl/api/proxy?url=" + enc(url)
+
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
 }

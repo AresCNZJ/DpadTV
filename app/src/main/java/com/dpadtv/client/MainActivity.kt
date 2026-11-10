@@ -3297,8 +3297,11 @@ class MainActivity : Activity() {
         isLive: Boolean = false,
     ) {
         if (urls.isEmpty()) return
+        // 直播统一走服务端代理：地方台直连经常被地区限制或断流，网页版就是靠代理播的
+        val finalUrls = if (isLive) urls.map { api.proxyUrl(it) } else urls
         startActivity(Intent(this, PlayerActivity::class.java).apply {
-            putStringArrayListExtra(PlayerActivity.EXTRA_URLS, ArrayList(urls))
+            putStringArrayListExtra(PlayerActivity.EXTRA_URLS, ArrayList(finalUrls))
+            if (isLive) putExtra(PlayerActivity.EXTRA_COOKIE, api.sessionCookie)
             putExtra(PlayerActivity.EXTRA_INDEX, index.coerceIn(0, urls.size - 1))
             putExtra(PlayerActivity.EXTRA_TITLE, title)
             putExtra(PlayerActivity.EXTRA_COVER, cover)
