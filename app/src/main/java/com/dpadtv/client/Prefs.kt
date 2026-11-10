@@ -78,13 +78,31 @@ class Prefs(ctx: Context) {
 
     /* --------------------------------------------------------------- 直播源 */
 
-    fun liveUrls(): MutableList<String> {
+    /**
+     * 直播源：既存地址也存名字。订阅里每条 liveSources 都带 name（★4K专区、zbds IPTV4…），
+     * 只存 url 的话界面上只能看到一长串链接，根本分不清哪个是哪个。
+     * 存储沿用 live_urls 这个键，每行「名字\t地址」；老数据只有地址也照常能读。
+     */
+    fun liveSources(): MutableList<LiveSource> {
         val text = sp.getString("live_urls", "") ?: ""
-        return if (text.isEmpty()) ArrayList() else text.split("\n").toMutableList()
+        if (text.isBlank()) return ArrayList()
+        return text.split("\n").filter { it.isNotBlank() }.map { line ->
+            val i = line.indexOf('\t')
+            if (i > 0) LiveSource(line.substring(0, i), line.substring(i + 1)) else LiveSource("", line)
+        }.toMutableList()
     }
 
+    fun saveLiveSources(list: List<LiveSource>) {
+        val text = list.joinToString("\n") { s ->
+            if (s.name.isEmpty()) s.url else s.name + "\t" + s.url
+        }
+        sp.edit().putString("live_urls", text).apply()
+    }
+
+    fun liveUrls(): MutableList<String> = liveSources().map { it.url }.toMutableList()
+
     fun saveLiveUrls(list: List<String>) {
-        sp.edit().putString("live_urls", list.joinToString("\n")).apply()
+        saveLiveSources(list.map { LiveSource("", it) })
     }
 
     var activeLiveUrl: String
@@ -335,4 +353,9 @@ object HomeBar {
         "setup" -> "设置"
         else -> id
     }
+}
+
+/** 一个直播源：显示名 + M3U 地址。name 可能为空（老数据或手动填写时没给）。 */
+data class LiveSource(val name: String, val url: String) {
+    val label: String get() = name.ifEmpty { url.substringAfter("//").substringBefore('/') }
 }

@@ -36,6 +36,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -59,6 +61,9 @@ class MainActivity : Activity() {
     private var recommendItems: List<DoubanItem> = emptyList()
     private var liveChannels: List<Channel> = emptyList()
     private var liveChannelSource: String = ""
+
+    /** 频道测活结果：url -> 能不能连上。换源时清空 */
+    private val liveProbeResult = mutableMapOf<String, Boolean>()
     private var mediaType = "movie"
     private var recommendPage = 0
     private var recommendTag = "热门"
@@ -986,7 +991,7 @@ class MainActivity : Activity() {
      */
     private fun importText(text: String) {
         val sources = api.parseSourceList(text)
-        val lives = api.parseLiveUrls(text)
+        val lives = api.parseLiveSources(text)
         if (sources.isEmpty() && lives.isEmpty()) {
             toast("没解析出片源。支持：网页版导出的 LibreTV-Settings_*.json、SourceList JSON、TVBOX 配置")
             return
@@ -994,15 +999,19 @@ class MainActivity : Activity() {
         val added = prefs.addSources(sources)
         var liveAdded = 0
         if (lives.isNotEmpty()) {
-            val current = prefs.liveUrls()
-            for (u in lives) {
-                if (!current.contains(u)) {
-                    current.add(u)
-                    liveAdded++
+            val current = prefs.liveSources()
+            for (src in lives) {
+                val idx = current.indexOfFirst { it.url == src.url }
+                when {
+                    idx < 0 -> {
+                        current.add(src)
+                        liveAdded++
+                    }
+                    current[idx].name.isEmpty() && src.name.isNotEmpty() -> current[idx] = src
                 }
             }
-            prefs.saveLiveUrls(current)
-            if (prefs.activeLiveUrl.isEmpty()) prefs.activeLiveUrl = current.first()
+            prefs.saveLiveSources(current)
+            if (prefs.activeLiveUrl.isEmpty()) prefs.activeLiveUrl = current.first().url
         }
         val liveNote = if (liveAdded > 0) "，直播源新增 $liveAdded" else ""
         toast("片源 ${sources.size} 个（新增 $added）$liveNote")
@@ -2569,22 +2578,28 @@ class MainActivity : Activity() {
             val subs = pairs.flatMap { it.first }
             // 直播源有两个来源：服务端直接配的 DEFAULT_LIVE_SOURCES + 订阅文件里的 liveSources
             val subLives = pairs.flatMap { it.second }
-            Triple(st, subs, (st.defaultLiveSources + subLives).distinct())
+            val serverLives = st.defaultLiveSources.map { LiveSource("", it) }
+            Triple(st, subs, (serverLives + subLives).distinctBy { it.url })
         }, { (st, subs, lives) ->
             val all = st.defaultSources + subs
             val added = if (all.isEmpty()) 0 else prefs.addSources(all)
 
             var liveAdded = 0
             if (lives.isNotEmpty()) {
-                val cur = prefs.liveUrls()
-                lives.forEach { u ->
-                    if (!cur.contains(u)) {
-                        cur.add(u)
-                        liveAdded++
+                val cur = prefs.liveSources()
+                lives.forEach { src ->
+                    val idx = cur.indexOfFirst { it.url == src.url }
+                    when {
+                        idx < 0 -> {
+                            cur.add(src)
+                            liveAdded++
+                        }
+                        // 老数据只存了地址：这次拿到了名字就补上，不然界面上永远是一串链接
+                        cur[idx].name.isEmpty() && src.name.isNotEmpty() -> cur[idx] = src
                     }
                 }
-                prefs.saveLiveUrls(cur)
-                if (prefs.activeLiveUrl.isEmpty()) prefs.activeLiveUrl = cur.firstOrNull().orEmpty()
+                prefs.saveLiveSources(cur)
+                if (prefs.activeLiveUrl.isEmpty()) prefs.activeLiveUrl = cur.firstOrNull()?.url.orEmpty()
             }
 
             if (all.isEmpty() && lives.isEmpty()) {
@@ -2603,14 +2618,16 @@ class MainActivity : Activity() {
 
     /** 直播源删除：列出已添加的 M3U 订阅，选一个确认后删掉 */
     private fun removeLiveSourceDialog() {
-        val urls = prefs.liveUrls()
-        if (urls.isEmpty()) {
+        val sources = prefs.liveSources()
+        if (sources.isEmpty()) {
             toast("还没有直播源")
             return
         }
         AlertDialog.Builder(this)
             .setTitle("删除直播源")
-            .setItems(urls.toTypedArray()) { _, which -> confirmRemoveLiveSource(urls[which]) }
+            .setItems(sources.map { it.label }.toTypedArray()) { _, which ->
+                confirmRemoveLiveSource(sources[which].url)
+            }
             .setNegativeButton("取消", null)
             .show()
     }
@@ -3281,16 +3298,18 @@ class MainActivity : Activity() {
 
     private fun showLive() {
         currentScreen = "live"
-        val urls = prefs.liveUrls()
-        if (urls.isEmpty()) {
+        val sources = prefs.liveSources()
+        if (sources.isEmpty()) {
             addLiveDialog()
             return
         }
-        val active = prefs.activeLiveUrl.ifEmpty { urls.first() }
+        val active = prefs.activeLiveUrl.ifEmpty { sources.first().url }
+        val activeLabel = sources.firstOrNull { it.url == active }?.label ?: "未命名"
         if (liveChannelSource != active || liveChannels.isEmpty()) {
             runApi("正在加载频道…", { api.liveChannels(active) }, { list ->
                 liveChannels = list
                 liveChannelSource = active
+                liveProbeResult.clear()
                 if (list.isEmpty()) toast("没解析到频道，换个直播源试试") else showLive()
             })
             return
@@ -3300,24 +3319,33 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(40), dp(20), dp(40), dp(16))
         }
-        val shown = if (liveGroupFilter.isEmpty()) {
-            liveChannels
-        } else {
-            liveChannels.filter { it.group == liveGroupFilter }
+        // 分组：有的 m3u 根本没带 group-title（比如 iptv-org 的 streams/cn.m3u），
+        // 服务端只能全部回落成「其他」。这种时候按频道名做个粗分类，总比 500 行一坨强
+        val channels = if (hasUsableGroups()) liveChannels else liveChannels.map { c ->
+            c.copy(group = inferLiveGroup(c.name))
         }
+        val shown = if (liveGroupFilter.isEmpty()) {
+            channels
+        } else {
+            channels.filter { it.group == liveGroupFilter }
+        }
+        val dead = liveProbeResult.count { !it.value }
         col.addView(topBar(
             "直播",
             back = { showRecommend() },
-            tail = "${shown.size}/${liveChannels.size} 个频道",
+            tail = buildString {
+                append("${shown.size}/${channels.size} 个频道")
+                if (liveProbeResult.isNotEmpty()) append(" · 已测活，死链 $dead")
+            },
         ))
 
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        bar.addView(button("换源") { pickLiveSource() })
+        bar.addView(button("源：" + activeLabel.take(12)) { pickLiveSource() })
         bar.addView(button("添加直播源") { addLiveDialog() })
         bar.addView(button("删除") { removeLiveSourceDialog() })
         bar.addView(
             button(if (liveGroupFilter.isEmpty()) "分组" else "分组：" + liveGroupFilter.take(10)) {
-                val groups = listOf("全部分组") + liveChannels.map { it.group }.distinct().sorted()
+                val groups = listOf("全部分组") + channels.map { it.group }.distinct().sorted()
                 AlertDialog.Builder(this)
                     .setTitle("按分组筛选")
                     .setItems(groups.toTypedArray()) { _, which ->
@@ -3327,12 +3355,21 @@ class MainActivity : Activity() {
                     .show()
             },
         )
+        bar.addView(button("测活") { probeLiveChannels(shown) })
         col.addView(hScroll(bar))
 
         val sorted = shown.sortedWith(compareBy({ it.group }, { it.name }))
         val listView = newList()
-        bindList(listView, 
-            sorted.map { "${it.group}  ·  ${it.name}" },
+        bindList(listView,
+            sorted.map { c ->
+                // 测过的画个记号：✗ 是已经确认打不开的，免得一个个点进去试
+                val mark = when (liveProbeResult[c.url]) {
+                    true -> "· "
+                    false -> "✗ "
+                    null -> ""
+                }
+                "$mark${c.group}  ·  ${c.name}"
+            },
             onItem = { idx -> play(sorted[idx].url, sorted[idx].name) },
         )
         col.addView(listView, LinearLayout.LayoutParams(
@@ -3342,18 +3379,73 @@ class MainActivity : Activity() {
         listView.requestFocus()
     }
 
+    /** 当前源的分组信息是否可用：全都空或全是一个「其他」就说明 m3u 里没带分组 */
+    private fun hasUsableGroups(): Boolean =
+        liveChannels.map { it.group.trim() }.filter { it.isNotEmpty() && it != "其他" }.distinct().size > 1
+
+    /** 没有分组的源，按频道名粗分类 —— 只是让列表能看，不追求精确 */
+    private fun inferLiveGroup(name: String): String = when {
+        name.contains("CCTV", true) || name.contains("央视", true) -> "央视"
+        name.contains("卫视") -> "卫视"
+        name.contains("春晚") -> "春晚"
+        name.contains("4K", true) || name.contains("8K", true) -> "4K/8K"
+        name.contains("电影") || name.contains("影视") || name.contains("剧场") -> "影视"
+        name.contains("少儿") || name.contains("动画") || name.contains("卡通") -> "少儿"
+        name.contains("纪录") || name.contains("纪实") -> "纪录"
+        name.contains("体育") || name.contains("足球") || name.contains("篮球") -> "体育"
+        name.contains("新闻") -> "新闻"
+        name.contains("音乐") || name.contains("MV", true) -> "音乐"
+        name.contains("地方") || name.contains("都市") -> "地方"
+        else -> {
+            // 关键词都没命中时：中文名归「其他」，英文名按首字母分桶
+            // （iptv-org 的 cn.m3u 全是英文台名，不这么做就是 500 多行挤在一个「其他」里）
+            val c = name.firstOrNull()
+            if (c != null && c.code < 128 && c.isLetter()) c.uppercaseChar().toString() else "其他"
+        }
+    }
+
+    /**
+     * 给当前列表逐个探活（并发 8 路，单个 4 秒超时）。
+     * 一次最多测 80 个：500 多个频道全测要等太久，先把当前分组测明白更实用。
+     */
+    private fun probeLiveChannels(list: List<Channel>) {
+        if (list.isEmpty()) {
+            toast("没有可测的频道")
+            return
+        }
+        val target = list.take(80)
+        scope.launch {
+            progress("正在测活 ${target.size} 个频道…")
+            val results = withContext(Dispatchers.IO) {
+                val out = mutableListOf<Pair<Channel, Boolean>>()
+                for (chunk in target.chunked(8)) {
+                    out += chunk.map { ch ->
+                        async(Dispatchers.IO) { ch to runCatching { api.probe(ch.url) }.getOrDefault(false) }
+                    }.awaitAll()
+                }
+                out
+            }
+            dismissProgress()
+            results.forEach { (ch, ok) -> liveProbeResult[ch.url] = ok }
+            val ok = results.count { it.second }
+            toast("测活完成：$ok/${results.size} 个能连上")
+            showLive()
+        }
+    }
+
     private fun pickLiveSource() {
-        val urls = prefs.liveUrls()
-        if (urls.isEmpty()) {
+        val sources = prefs.liveSources()
+        if (sources.isEmpty()) {
             addLiveDialog()
             return
         }
         AlertDialog.Builder(this)
             .setTitle("选择直播源")
-            .setItems(urls.toTypedArray()) { _, which ->
-                prefs.activeLiveUrl = urls[which]
+            .setItems(sources.map { it.label }.toTypedArray()) { _, which ->
+                prefs.activeLiveUrl = sources[which].url
                 liveChannels = emptyList()
                 liveChannelSource = ""
+                liveProbeResult.clear()
                 showLive()
             }
             .setPositiveButton("添加新的", { _, _ -> addLiveDialog() })
@@ -3366,6 +3458,8 @@ class MainActivity : Activity() {
             setPadding(dp(24), dp(12), dp(24), 0)
         }
         box.addView(hintText("填 M3U 播放列表地址。服务端会去抓这个地址，所以必须是公网可访问的（内网地址会被拒）。"))
+        val nameField = field("名称（可留空）")
+        box.addView(nameField)
         val urlField = field("https://iptv-org.github.io/iptv/countries/cn.m3u")
         box.addView(urlField)
         AlertDialog.Builder(this)
@@ -3374,12 +3468,14 @@ class MainActivity : Activity() {
             .setPositiveButton("添加") { _, _ ->
                 val u = urlField.text.toString().trim()
                 if (u.isEmpty()) return@setPositiveButton
-                val list = prefs.liveUrls()
-                if (!list.contains(u)) list.add(u)
-                prefs.saveLiveUrls(list)
+                val name = nameField.text.toString().trim()
+                val list = prefs.liveSources()
+                if (list.none { it.url == u }) list.add(LiveSource(name, u))
+                prefs.saveLiveSources(list)
                 prefs.activeLiveUrl = u
                 liveChannels = emptyList()
                 liveChannelSource = ""
+                liveProbeResult.clear()
                 showLive()
             }
             .setNegativeButton("取消", null)

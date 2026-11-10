@@ -322,29 +322,56 @@ class Api(baseUrl: String) {
      * liveSubscriptions / liveSelectedUrls 都是这个意思。一次请求把两者都取回来，
      * 免得「同步完片源有了、直播页还是空的」。
      */
-    fun importSubscription(url: String): Pair<List<SourceConfig>, List<String>> {
+    fun importSubscription(url: String): Pair<List<SourceConfig>, List<LiveSource>> {
         val text = readBody(open("/api/source-list?url=" + enc(url)))
-        return parseSourceList(text) to parseLiveUrls(text)
+        return parseSourceList(text) to parseLiveSources(text)
     }
 
-    /** 从一份订阅/导出 JSON 里抠出全部直播源地址（多种字段形状） */
-    fun parseLiveUrls(text: String): List<String> {
-        val out = LinkedHashSet<String>()
+    /**
+     * 从一份订阅/导出 JSON 里抠出直播源（名字 + 地址）。
+     * 订阅里的 liveSources 每条都带 name，丢掉名字界面上就只剩一长串链接。
+     */
+    fun parseLiveSources(text: String): List<LiveSource> {
+        val out = LinkedHashMap<String, LiveSource>()
         runCatching {
             val root = JSONObject(text)
             for (key in listOf("liveSources", "liveSubscriptions", "lives")) {
                 val arr = root.optJSONArray(key) ?: continue
                 for (i in 0 until arr.length()) {
                     when (val v = arr.opt(i)) {
-                        is String -> if (v.isNotEmpty()) out.add(v)
-                        is JSONObject -> v.optString("url", "").takeIf { it.isNotEmpty() }?.let(out::add)
+                        is String -> if (v.isNotEmpty()) out.putIfAbsent(v, LiveSource("", v))
+                        is JSONObject -> {
+                            val u = v.optString("url", "")
+                            if (u.isNotEmpty()) out.putIfAbsent(u, LiveSource(v.optString("name", ""), u))
+                        }
                     }
                 }
             }
         }
-        // 网页版导出的 liveSelectedUrls 走原解析器
-        out.addAll(parseLiveFromExport(text))
-        return out.toList()
+        // 网页版导出的 liveSelectedUrls 只有地址
+        parseLiveFromExport(text).forEach { out.putIfAbsent(it, LiveSource("", it)) }
+        return out.values.toList()
+    }
+
+    /** 只要地址的旧接口 */
+    fun parseLiveUrls(text: String): List<String> = parseLiveSources(text).map { it.url }
+
+    /** 探测一个流是否还能播：能拿到响应头就算活（HLS 的 .m3u8 一般 200/206） */
+    fun probe(url: String, timeoutMs: Int = 4000): Boolean {
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = URL(url).openConnection() as HttpURLConnection
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
+            conn.instanceFollowRedirects = true
+            conn.setRequestProperty("Range", "bytes=0-2047")
+            conn.setRequestProperty("User-Agent", "DpadTV-Android")
+            conn.responseCode in 200..399
+        } catch (e: Exception) {
+            false
+        } finally {
+            runCatching { conn?.disconnect() }
+        }
     }
 
     /** 本地解析。兼容三种格式：网页版导出（LibreTV-Settings）、LibreTV-SourceList、TVBOX 配置。 */
