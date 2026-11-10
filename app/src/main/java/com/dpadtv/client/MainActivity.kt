@@ -71,9 +71,13 @@ class MainActivity : Activity() {
     /** 收藏夹视图：不区分直播源，列出全部收藏 */
     private var liveShowFavorites = false
 
-    /** 当前列表里显示的频道，收藏按钮要用它把「选中的那一行」翻回去 */
+    /** 当前列表里显示的频道 */
     private var liveShown: List<Channel> = emptyList()
+    /** 排序后实际渲染的行，左右键要靠它把「当前行」翻回频道 */
+    private var liveSorted: List<Channel> = emptyList()
     private var liveListView: ListView? = null
+    /** 列表当前焦点所在的行号（selectedItemPosition 会因数据刷新失效，自己记一份） */
+    private var livePos = 0
     private var mediaType = "movie"
     private var recommendPage = 0
     private var recommendTag = "热门"
@@ -3384,7 +3388,6 @@ class MainActivity : Activity() {
                 },
             )
         }
-        bar.addView(button(if (isSelectedFavorite()) "取消收藏" else "收藏") { toggleFavoriteSelected() })
         bar.addView(button(if (liveShowFavorites) "收藏夹中" else "收藏夹") {
             if (!liveShowFavorites) liveShowFavorites = true
             showLive()
@@ -3398,11 +3401,87 @@ class MainActivity : Activity() {
         }
         col.addView(hScroll(bar))
 
+        col.addView(hintText("选中频道后：按右键收藏 ★，按左键取消收藏"))
+
         val sorted = shown.sortedWith(compareBy({ it.group }, { it.name }))
+        liveSorted = sorted
         val listView = newList()
         liveListView = listView
-        bindList(listView, sorted.map { liveRowLabel(it) },
-            onItem = { idx -> play(sorted[idx].url, sorted[idx].name) })
+        // 单焦点遥控器上「先选中行、再挪到按钮点收藏」根本走不通，
+        // 所以收藏/取消收藏直接绑在列表的左右键上，按完原地刷新星标
+        val adapter = object : BaseAdapter() {
+            override fun getCount(): Int = liveSorted.size
+            override fun getItem(position: Int): Any = liveSorted[position]
+            override fun getItemId(position: Int): Long = position.toLong()
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val tv = (convertView as? TextView) ?: TextView(this@MainActivity).apply {
+                    setTextSize(17f)
+                    setPadding(dp(18), dp(12), dp(18), dp(12))
+                    isFocusable = true
+                    isFocusableInTouchMode = true
+                }
+                val ch = liveSorted[position]
+                tv.text = liveRowLabel(ch)
+                tv.setOnClickListener { play(ch.url, ch.name) }
+                applyFocusStyle(tv, Color.TRANSPARENT, tv)
+                return tv
+            }
+        }
+        listView.adapter = adapter
+        listView.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                livePos = position
+            }
+
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+        }
+        // 原地刷新某一行的文字：既保留焦点，也避免 notifyDataSetChanged 把选中位置打回 0
+        fun refreshRow(pos: Int) {
+            val child = listView.getChildAt(pos - listView.firstVisiblePosition) as? TextView
+            liveSorted.getOrNull(pos)?.let { child?.text = liveRowLabel(it) }
+        }
+        listView.setOnItemClickListener { _, _, position, _ ->
+            val ch = liveSorted.getOrNull(position) ?: return@setOnItemClickListener
+            play(ch.url, ch.name)
+        }
+        listView.setOnKeyListener { v, keyCode, event ->
+            if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
+            // 用自己记的 livePos：selectedItemPosition 在数据刷新后会失效
+            val pos = livePos
+            val isOk = keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                keyCode == KeyEvent.KEYCODE_ENTER || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+            when {
+                // 有些遥控器的 OK 不走 onItemClick，这里兜一下
+                isOk -> {
+                    val ch = liveSorted.getOrNull(pos) ?: return@setOnKeyListener false
+                    play(ch.url, ch.name)
+                    true
+                }
+                keyCode == KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    val ch = liveSorted.getOrNull(pos) ?: return@setOnKeyListener false
+                    if (!prefs.isFavorite(ch.url)) {
+                        prefs.toggleFavorite(FavLive(ch.name, ch.url, ch.group))
+                        toast("已收藏：${ch.name}")
+                        refreshRow(pos)
+                    } else {
+                        toast("已经在收藏夹里了")
+                    }
+                    true
+                }
+                keyCode == KeyEvent.KEYCODE_DPAD_LEFT -> {
+                    val ch = liveSorted.getOrNull(pos) ?: return@setOnKeyListener false
+                    if (prefs.isFavorite(ch.url)) {
+                        prefs.toggleFavorite(FavLive(ch.name, ch.url, ch.group))
+                        toast("已取消收藏：${ch.name}")
+                        if (liveShowFavorites) showLive() else refreshRow(pos)
+                    } else {
+                        toast("这个频道还没收藏")
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
         col.addView(listView, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
@@ -3435,26 +3514,6 @@ class MainActivity : Activity() {
 
     private fun favoritesAsChannels(): List<Channel> =
         prefs.favorites().map { Channel(it.name, it.url, it.group.ifEmpty { "收藏" }, "") }
-
-    private fun selectedChannel(): Channel? {
-        val lv = liveListView ?: return null
-        val pos = lv.selectedItemPosition
-        val sorted = liveShown.sortedWith(compareBy({ it.group }, { it.name }))
-        return sorted.getOrNull(pos)
-    }
-
-    private fun isSelectedFavorite(): Boolean = selectedChannel()?.let { prefs.isFavorite(it.url) } ?: false
-
-    private fun toggleFavoriteSelected() {
-        val c = selectedChannel()
-        if (c == null) {
-            toast("先用遥控器选中一个频道")
-            return
-        }
-        val now = prefs.toggleFavorite(FavLive(c.name, c.url, c.group))
-        toast(if (now) "已收藏：${c.name}" else "已取消收藏：${c.name}")
-        showLive()
-    }
 
     /** 当前源的分组信息是否可用：全都空或全是一个「其他」就说明 m3u 里没带分组 */
     private fun hasUsableGroups(): Boolean =
