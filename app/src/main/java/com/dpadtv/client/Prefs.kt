@@ -278,6 +278,11 @@ class Prefs(ctx: Context) {
             .apply()
     }
 
+    /** 搜索时只用「测试可用且有结果条目」的源（片源管理 → 更多 里切换） */
+    var searchOnlyAvailable: Boolean
+        get() = sp.getBoolean("search_only_available", false)
+        set(v) = sp.edit().putBoolean("search_only_available", v).apply()
+
     /** 最近一次测试结果：null 表示没测过 */
     fun sourceTest(url: String): Pair<Boolean, Long>? {
         val k = "st_ok:" + url.hashCode()
@@ -316,11 +321,12 @@ class Prefs(ctx: Context) {
 }
 
 object HomeBar {
-    val DEFAULT = listOf("movie", "tv", "show", "search", "live", "history", "sources", "setup")
+    val DEFAULT = listOf("movie", "tv", "anime", "show", "search", "live", "history", "sources", "setup")
 
     fun label(id: String): String = when (id) {
         "movie" -> "电影"
         "tv" -> "剧集"
+        "anime" -> "动漫"
         "show" -> "综艺"
         "search" -> "搜索"
         "live" -> "直播"

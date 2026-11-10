@@ -7,8 +7,11 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.BaseAdapter
 import android.widget.FrameLayout
+import android.widget.GridView
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -21,7 +24,6 @@ import androidx.media3.common.Player
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.analytics.PlaybackStatsListener
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -32,14 +34,15 @@ import androidx.media3.ui.PlayerView
  * 按键逻辑（电视遥控器）：
  *   · OK           暂停 / 播放
  *   · 上           打开倍速菜单
- *   · 左右         快退 / 快进（短按 10 秒，按住 15 秒连发）
- *   · 下 / 菜单键   呼出底部操作栏（下集/上集/刷新/重播/倍速/解码/比例）
+ *   · 下 / 菜单键   呼出底部操作栏（选集/上下集/倍速/解码/画幅/重播/刷新）
+ *   · 左右         按设置里的步长快退 / 快进，按住连发
  *   · 返回         退出播放
  *
  * 操作栏出现时，按键交给操作栏自己处理（左右移动、OK 执行），不再触发 seek。
+ * 选集面板打开时，按键交给网格（方向键选择、OK 跳转、返回关闭）。
  *
- * 片名默认隐藏，只在暂停、操作栏打开、或出错时出现。
- * 缓冲时在「缓冲中…」下面显示实时网速（按累计字节差分计算）。
+ * 片名默认隐藏，只在暂停、操作栏打开、或出错时出现；切集时会短暂闪一下。
+ * 缓冲时在「缓冲中…」下面显示实时网速（DataSource 层实测网络吞吐，见 NetSpeed.kt）。
  */
 class PlayerActivity : Activity() {
 
@@ -50,23 +53,36 @@ class PlayerActivity : Activity() {
         const val EXTRA_INDEX = "index"
         const val EXTRA_TITLE = "title"
         const val EXTRA_COVER = "cover"
+
+        /** 「从头播放」：忽略续播记录，从 0 开始 */
+        const val EXTRA_FROM_START = "from_start"
+
         private const val SAVE_INTERVAL_MS = 5_000L
         private const val HIDE_UI_DELAY_MS = 4_000L
         private const val HIDE_ACTIONS_DELAY_MS = 6_000L
+        private const val TITLE_HOLD_MS = 3_000L
     }
 
     private var player: ExoPlayer? = null
     private lateinit var playerView: PlayerView
     private lateinit var titleText: TextView
+    private lateinit var speedBadge: TextView
     private lateinit var progressRow: LinearLayout
     private lateinit var playPauseIcon: ImageView
     private lateinit var seekBar: ProgressBar
     private lateinit var timeText: TextView
+    private lateinit var bufferingBox: LinearLayout
     private lateinit var bufferingText: TextView
     private lateinit var speedText: TextView
     private lateinit var actionBar: LinearLayout
     private lateinit var speedActionBtn: TextView
+    private lateinit var decodeActionBtn: TextView
+    private lateinit var aspectActionBtn: TextView
     private lateinit var actionScroll: HorizontalScrollView
+    private lateinit var seekHint: TextView
+    private lateinit var pickerOverlay: FrameLayout
+    private lateinit var pickerGrid: GridView
+    private lateinit var pickerTitle: TextView
     private lateinit var prefs: Prefs
 
     private var urls: List<String> = emptyList()
@@ -76,13 +92,14 @@ class PlayerActivity : Activity() {
     private var pendingSeek = -1L
     private var hasError = false
     private var aspectMode = 0
+    private var fromStart = false
+    private var seekStepMs = 15_000L
+    private var pickerVisible = false
 
     private val handler = Handler(Looper.getMainLooper())
 
-    /** 网速采样：用累计字节/累计耗时做差分 */
-    private val statsListener = PlaybackStatsListener(false, null)
-    private var lastBytes = 0L
-    private var lastMs = 0L
+    /** 网速实测：统计真正走网络（缓存未命中）的读取吞吐，见 NetSpeed.kt */
+    private val netSpeedMeter = NetSpeedMeter()
 
     private val saveTick = object : Runnable {
         override fun run() {
@@ -101,36 +118,42 @@ class PlayerActivity : Activity() {
     private val speedTick = object : Runnable {
         override fun run() {
             if (!::speedText.isInitialized || speedText.visibility != View.VISIBLE) return
-            val stats = statsListener.playbackStats
-            val bytes = stats?.totalBandwidthBytes ?: 0L
-            val ms = stats?.totalBandwidthTimeMs ?: 0L
-            if (ms > lastMs && bytes >= lastBytes) {
-                val db = bytes - lastBytes
-                val dm = ms - lastMs
-                if (dm > 0) speedText.text = "网速 " + formatSpeed(db * 8000L / dm)
-            }
-            lastBytes = bytes
-            lastMs = ms
+            val bps = netSpeedMeter.bitsPerSecond()
+            speedText.text = if (bps != null) "网速 " + formatSpeed(bps) else "测速中…"
             handler.postDelayed(this, 500)
         }
     }
 
     private val clearPendingSeek = Runnable { pendingSeek = -1L }
 
+    /** 片名胶囊的「临时展示」计时：切集时闪 3 秒，之后跟着暂停/控制条状态走 */
+    private var titleHold = 0L
+
+    private val hideTitle = Runnable {
+        titleHold = 0L
+        updateChrome()
+    }
+
+    private val hideSeekHint = Runnable {
+        if (::seekHint.isInitialized) seekHint.visibility = View.GONE
+    }
+
     private val hideUi = Runnable {
         val p = player
         val paused = p != null && !p.playWhenReady && p.playbackState != Player.STATE_IDLE
-        handler.removeCallbacks(uiTick)
-        // 暂停时控制条常驻；操作栏打开时也不隐藏
-        if (!paused && !isActionBarVisible()) {
+        // 暂停时控制条常驻；操作栏/选集中也不隐藏
+        if (!paused && !isActionBarVisible() && !pickerVisible) {
             progressRow.visibility = View.GONE
+            // 只有进度条真的收起来，500ms 刷新循环才能停 ——
+            // 暂停时条子常驻，后台还在继续缓冲，secondaryProgress 得跟着长
+            handler.removeCallbacks(uiTick)
         }
         updateChrome()
     }
 
     private val hideActions = Runnable {
-        if (isActionBarVisible()) setActionBarVisible(false)
-        updateChrome()
+        // 操作栏到点只收自己；进度条/标题走 collapseToProgress() 再挂 4 秒
+        if (isActionBarVisible()) collapseToProgress()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -143,6 +166,8 @@ class PlayerActivity : Activity() {
         currentIndex = intent.getIntExtra(EXTRA_INDEX, 0).coerceIn(0, (urls.size - 1).coerceAtLeast(0))
         seriesTitle = intent.getStringExtra(EXTRA_TITLE).orEmpty()
         coverUrl = intent.getStringExtra(EXTRA_COVER).orEmpty()
+        fromStart = intent.getBooleanExtra(EXTRA_FROM_START, false)
+        seekStepMs = prefs.seekStepSeconds.coerceIn(5, 120) * 1000L
 
         val root = FrameLayout(this)
         root.setBackgroundColor(android.graphics.Color.BLACK)
@@ -158,17 +183,27 @@ class PlayerActivity : Activity() {
             ),
         )
 
-        // 片名：默认隐藏，暂停 / 操作栏 / 出错时才显示
+        // 片名：默认隐藏，暂停 / 操作栏 / 出错时才显示。做成半透明胶囊，
+        // 直接铺白字在亮画面上会看不清（原来的做法）。
         titleText = TextView(this).apply {
             baseText = labelFor(currentIndex)
             setText(baseText)
-            setTextColor(android.graphics.Color.parseColor("#cbd5e1"))
-            setTextSize(14f)
-            setPadding(48, 28, 48, 0)
+            setTextColor(Ui.TEXT)
+            setTextSize(15f)
+            setPadding(dp(18), dp(9), dp(18), dp(9))
+            background = Ui.bg(this@PlayerActivity, 0x99000000.toInt(), Ui.R_BTN)
             visibility = View.GONE
         }
+        val titleWrap = FrameLayout(this).apply {
+            isFocusable = false
+            setPadding(dp(28), dp(24), dp(28), 0)
+            addView(titleText, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+        }
         root.addView(
-            titleText,
+            titleWrap,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -176,11 +211,31 @@ class PlayerActivity : Activity() {
             ),
         )
 
+        // 右上角倍速角标：非 1.0 倍速时常驻，避免用户忘了自己开过倍速
+        speedBadge = TextView(this).apply {
+            setTextColor(Ui.ACCENT)
+            setTextSize(13f)
+            setPadding(dp(14), dp(7), dp(14), dp(7))
+            background = Ui.bg(this@PlayerActivity, 0x99000000.toInt(), Ui.R_BTN)
+            visibility = View.GONE
+        }
+        root.addView(
+            speedBadge,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.RIGHT,
+            ).apply {
+                topMargin = dp(24)
+                rightMargin = dp(28)
+            },
+        )
+
         // 进度条：左播放/暂停图标 + 进度 + 时间 + 倍速标签（都不可聚焦）
         progressRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(48, 20, 48, 20)
+            setPadding(dp(28), dp(10), dp(28), dp(10))
             setBackgroundColor(0xB3000000.toInt())
             visibility = View.GONE
         }
@@ -215,22 +270,40 @@ class PlayerActivity : Activity() {
             ),
         )
 
-        // 底部操作栏（默认隐藏）
-        actionBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        actionBar.addView(actionButton("下集") {
-            if (player?.hasNextMediaItem() == true) {
-                player?.seekToNextMediaItem()
-            } else {
-                toast("已是最后一集")
-            }
-            showActions()
-        })
-        actionBar.addView(actionButton("上集") {
-            if (player?.hasPreviousMediaItem() == true) {
-                player?.seekToPreviousMediaItem()
-            } else {
-                toast("已是第一集")
-            }
+        // 底部操作栏（默认隐藏）。单集影片没有「选集/上下集」，只留播放相关的项，
+        // 免得点了一圈都是「已是最后一集」的提示。
+        actionBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        if (urls.size > 1) {
+            actionBar.addView(actionButton("选集") { showEpisodePicker() })
+            actionBar.addView(actionButton("上集") {
+                if (player?.hasPreviousMediaItem() == true) {
+                    player?.seekToPreviousMediaItem()
+                } else {
+                    toast("已是第一集")
+                }
+                showActions()
+            })
+            actionBar.addView(actionButton("下集") {
+                if (player?.hasNextMediaItem() == true) {
+                    player?.seekToNextMediaItem()
+                } else {
+                    toast("已是最后一集")
+                }
+                showActions()
+            })
+        }
+        speedActionBtn = actionButton("倍速 X1.00") { showSpeedMenu() }
+        actionBar.addView(speedActionBtn)
+        decodeActionBtn = actionButton(decodeLabel()) { showDecodeMenu() }
+        actionBar.addView(decodeActionBtn)
+        aspectActionBtn = actionButton(aspectLabel()) { showAspectMenu() }
+        actionBar.addView(aspectActionBtn)
+        actionBar.addView(actionButton("重播") {
+            player?.seekTo(currentIndex, 0L)
+            player?.play()
             showActions()
         })
         actionBar.addView(actionButton("刷新") {
@@ -241,20 +314,11 @@ class PlayerActivity : Activity() {
             toast("已重新加载")
             showActions()
         })
-        actionBar.addView(actionButton("重播") {
-            player?.seekTo(currentIndex, 0L)
-            player?.play()
-            showActions()
-        })
-        speedActionBtn = actionButton("倍速 X1.00") { showSpeedMenu() }
-        actionBar.addView(speedActionBtn)
-        actionBar.addView(actionButton("解码") { showDecodeMenu() })
-        actionBar.addView(actionButton("比例") { showAspectMenu() })
 
         actionScroll = HorizontalScrollView(this).apply {
             isFocusable = false
-            descendantFocusability = android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS
-            setPadding(dp(48), 0, dp(48), 0)
+            descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+            setPadding(dp(28), 0, dp(28), 0)
             addView(actionBar)
             visibility = View.GONE
         }
@@ -264,26 +328,37 @@ class PlayerActivity : Activity() {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM,
-            ).apply { bottomMargin = dp(48) },
+            ).apply { bottomMargin = dp(56) },
         )
 
-        // 缓冲提示 + 网速
+        // 缓冲提示：转圈 + 文案 + 网速。原来只有一行字，看不出「是在转还是卡死了」
         bufferingText = TextView(this).apply {
             setText("缓冲中…")
-            setTextColor(android.graphics.Color.parseColor("#cbd5e1"))
-            setTextSize(18f)
+            setTextColor(Ui.TEXT)
+            setTextSize(17f)
+            gravity = Gravity.CENTER_HORIZONTAL
             visibility = View.VISIBLE
         }
         speedText = TextView(this).apply {
             setText("测速中…")
-            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+            setTextColor(Ui.TEXT_DIM)
             setTextSize(13f)
             setPadding(0, dp(6), 0, 0)
+            gravity = Gravity.CENTER_HORIZONTAL
             visibility = View.VISIBLE
         }
-        val bufferingBox = LinearLayout(this).apply {
+        bufferingBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
+            addView(
+                ProgressBar(this@PlayerActivity).apply {
+                    indeterminateTintList = android.content.res.ColorStateList.valueOf(Ui.ACCENT)
+                },
+                LinearLayout.LayoutParams(dp(40), dp(40)).apply {
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    bottomMargin = dp(10)
+                },
+            )
             addView(bufferingText)
             addView(speedText)
         }
@@ -295,6 +370,25 @@ class PlayerActivity : Activity() {
                 Gravity.CENTER,
             ),
         )
+
+        // 快进/快退提示：屏幕正中的大号气泡
+        seekHint = TextView(this).apply {
+            setTextSize(22f)
+            setTextColor(Ui.BRIGHT)
+            setPadding(dp(30), dp(16), dp(30), dp(16))
+            background = Ui.bg(this@PlayerActivity, 0xCC0B101A.toInt(), Ui.R_CARD)
+            visibility = View.GONE
+        }
+        root.addView(
+            seekHint,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER,
+            ).apply { bottomMargin = dp(90) },   // 抬高一点，别和中央的「缓冲中」叠在一起
+        )
+
+        buildPicker(root)
 
         setContentView(root)
 
@@ -315,7 +409,7 @@ class PlayerActivity : Activity() {
             .setReadTimeoutMs(15_000)
         val cacheFactory = androidx.media3.datasource.cache.CacheDataSource.Factory()
             .setCache(PlaybackCache.get(this))
-            .setUpstreamDataSourceFactory(httpFactory)
+            .setUpstreamDataSourceFactory(MeteredDataSource.Factory(httpFactory, netSpeedMeter))
             .setFlags(androidx.media3.datasource.cache.CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
         val mediaSourceFactory =
             androidx.media3.exoplayer.source.DefaultMediaSourceFactory(cacheFactory)
@@ -327,7 +421,6 @@ class PlayerActivity : Activity() {
             .build()
             .also { exo ->
                 playerView.player = exo
-                exo.addAnalyticsListener(statsListener)
                 exo.setPlaybackSpeed(prefs.playbackSpeed)
                 exo.pauseAtEndOfMediaItems = !prefs.autoNext
 
@@ -338,10 +431,12 @@ class PlayerActivity : Activity() {
                         baseText = labelFor(currentIndex)
                         if (!hasError) {
                             titleText.text = baseText
-                            titleText.setTextColor(android.graphics.Color.parseColor("#cbd5e1"))
+                            titleText.setTextColor(Ui.TEXT)
                         }
-                        bufferingText.visibility = View.VISIBLE
+                        bufferingBox.visibility = View.VISIBLE
                         updateChrome()
+                        // 切集时把片名闪一下：不然自动连播时用户不知道放到第几集了
+                        flashTitle()
                         if (urls.size > 1 && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                             toast("自动播放：第 ${currentIndex + 1} 集")
                         }
@@ -349,16 +444,16 @@ class PlayerActivity : Activity() {
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         val buffering = playbackState == Player.STATE_BUFFERING
-                        bufferingText.visibility = if (buffering) View.VISIBLE else View.GONE
+                        bufferingBox.visibility = if (buffering) View.VISIBLE else View.GONE
                         speedText.visibility = if (buffering) View.VISIBLE else View.GONE
                         handler.removeCallbacks(speedTick)
                         if (buffering) {
-                            lastBytes = 0L
-                            lastMs = 0L
                             handler.post(speedTick)
                         }
                         if (playbackState == Player.STATE_ENDED) {
                             prefs.clearProgress(currentUrl())
+                            // 全部放完后把操作栏亮出来，直接就能选集/换片
+                            showActions()
                         }
                         updateChrome()
                     }
@@ -366,27 +461,34 @@ class PlayerActivity : Activity() {
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
                         updatePlayPauseIcon()
                         updateChrome()
-                        if (!isPlaying) showProgress()
+                        // 缓冲时 isPlaying 同样会变 false：那种时刻只要中央的转圈 + 网速，
+                        // 不要把进度条和标题也拉起来。只有用户主动暂停才展示控制条。
+                        val pausedByUser = player?.playWhenReady == false
+                        if (!isPlaying && pausedByUser) showProgress()
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
                         val msg = if (error.errorCodeName.contains("DECODER", true)) {
-                            "解码失败：这个片源可能是 H.265 / 不支持的编码 · 按返回键换源"
+                            "解码失败：这个片源可能是 H.265 / 不支持的编码"
                         } else {
-                            "播放失败：${error.errorCodeName} · 按返回键换源"
+                            "播放失败：${error.errorCodeName}"
                         }
                         hasError = true
-                        baseText = msg
-                        titleText.text = msg
-                        titleText.setTextColor(android.graphics.Color.parseColor("#fca5a5"))
-                        bufferingText.visibility = View.GONE
+                        baseText = "$msg  ·  按菜单键换集或换源"
+                        titleText.text = baseText
+                        titleText.setTextColor(Ui.DANGER)
+                        bufferingBox.visibility = View.GONE
                         speedText.visibility = View.GONE
                         updateChrome()
+                        // 出错时把操作栏顶出来：用户不用先摸索按键就能换下一集
+                        showActions()
                     }
                 })
 
                 val items = urls.map { MediaItem.fromUri(it) }
-                val resume = if (prefs.resumeEnabled) prefs.progressOf(currentUrl()) else 0L
+                // 「从头播放」要真的从头：清掉这一集的历史进度，否则下次还会续播
+                if (fromStart) prefs.clearProgress(currentUrl())
+                val resume = if (prefs.resumeEnabled && !fromStart) prefs.progressOf(currentUrl()) else 0L
                 val threshold = prefs.resumeThresholdSeconds * 1000L
                 exo.setMediaItems(items, currentIndex, if (resume > threshold) resume else 0L)
                 exo.prepare()
@@ -403,6 +505,120 @@ class PlayerActivity : Activity() {
         handler.postDelayed(saveTick, SAVE_INTERVAL_MS)
         updatePlayPauseIcon()
         updateChrome()
+        flashTitle()
+    }
+
+    /* ------------------------------------------------------------ 选集面板 */
+
+    /**
+     * 选集网格。原先只能靠「上集 / 下集」一个个跳，40 集的剧想直接看第 30 集
+     * 要按 29 次遥控器。这里给一个可 D-pad 浏览的网格，OK 直接跳转、返回关闭。
+     */
+    private fun buildPicker(root: FrameLayout) {
+        pickerOverlay = FrameLayout(this).apply {
+            setBackgroundColor(0xCC000000.toInt())
+            visibility = View.GONE
+        }
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(28), dp(20), dp(28), dp(20))
+            background = Ui.bg(this@PlayerActivity, Ui.BG, Ui.R_CARD, 0, 1, Ui.STROKE)
+        }
+        pickerTitle = TextView(this).apply {
+            setTextSize(17f)
+            setTextColor(Ui.TEXT)
+            setPadding(0, 0, 0, dp(14))
+        }
+        panel.addView(pickerTitle)
+
+        pickerGrid = GridView(this).apply {
+            numColumns = 8
+            horizontalSpacing = dp(6)
+            verticalSpacing = dp(6)
+            stretchMode = GridView.STRETCH_COLUMN_WIDTH
+            isFocusable = true
+            isFocusableInTouchMode = true
+            // 选中格：淡蓝填充 + 2dp 描边，和主界面列表同一套
+            setSelector(Ui.bg(this@PlayerActivity, 0x1A38BDF8, Ui.R_BTN, 0, 2, Ui.ACCENT))
+            adapter = object : BaseAdapter() {
+                override fun getCount() = urls.size
+                override fun getItem(position: Int): Any = position
+                override fun getItemId(position: Int) = position.toLong()
+                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                    val tv = (convertView as? TextView)
+                        ?: TextView(this@PlayerActivity).apply {
+                            gravity = Gravity.CENTER
+                            setTextSize(15f)
+                            layoutParams = android.widget.AbsListView.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT, dp(40),
+                            )
+                        }
+                    tv.text = "${position + 1}"
+                    // 正在播放的这一集常亮，方便一眼看到自己在哪
+                    tv.setTextColor(
+                        if (position == currentIndex) Ui.ACCENT else Ui.TEXT_DIM,
+                    )
+                    return tv
+                }
+            }
+        }
+        pickerGrid.setOnItemClickListener { _, _, position, _ ->
+            if (position != currentIndex) {
+                player?.seekTo(position, 0L)
+                player?.play()
+            }
+            hideEpisodePicker()
+        }
+        panel.addView(
+            pickerGrid,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(40) * 3 + dp(12),
+            ),
+        )
+
+        pickerOverlay.addView(
+            panel,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER,
+            ).apply {
+                leftMargin = dp(120)
+                rightMargin = dp(120)
+            },
+        )
+        root.addView(
+            pickerOverlay,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+    }
+
+    private fun showEpisodePicker() {
+        if (urls.size <= 1) return
+        setActionBarVisible(false)
+        pickerTitle.text = "${seriesTitle.ifEmpty { "选集" }}  ·  共 ${urls.size} 集  ·  返回键关闭"
+        // 高度跟着集数走：3 集就是一行，200 集就滚动，别让空面板占满屏幕
+        val rows = ((urls.size + 7) / 8).coerceIn(1, 5)
+        pickerGrid.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, rows * dp(46),
+        )
+        pickerOverlay.visibility = View.VISIBLE
+        pickerVisible = true
+        progressRow.visibility = View.VISIBLE
+        handler.removeCallbacks(hideUi)
+        pickerGrid.setSelection(currentIndex)
+        pickerGrid.requestFocus()
+        updateChrome()
+    }
+
+    private fun hideEpisodePicker() {
+        pickerOverlay.visibility = View.GONE
+        pickerVisible = false
+        showProgress()
     }
 
     /* ------------------------------------------------------------ 显示逻辑 */
@@ -413,28 +629,48 @@ class PlayerActivity : Activity() {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
     }
 
-    /** 片名可见性：出错 / 暂停 / 控制条或操作栏显示中 */
+    /** 片名可见性：出错 / 暂停 / 控制条或操作栏显示中 / 切集后的 3 秒 */
     private fun updateChrome() {
         if (!::titleText.isInitialized) return
         val p = player
         val paused = p != null && !p.playWhenReady && p.playbackState != Player.STATE_IDLE
         val chromeVisible = (::progressRow.isInitialized && progressRow.visibility == View.VISIBLE) ||
-            isActionBarVisible()
+            isActionBarVisible() || pickerVisible || titleHold > 0
         titleText.visibility = if (hasError || paused || chromeVisible) View.VISIBLE else View.GONE
+        updateSpeedBadge()
+    }
+
+    /** 切集时把片名胶囊亮 3 秒，然后交回给 updateChrome 的常态判断 */
+    private fun flashTitle() {
+        if (!::titleText.isInitialized) return
+        titleHold = TITLE_HOLD_MS
+        titleText.visibility = View.VISIBLE
+        handler.removeCallbacks(hideTitle)
+        handler.postDelayed(hideTitle, TITLE_HOLD_MS)
+    }
+
+    private fun updateSpeedBadge() {
+        if (!::speedBadge.isInitialized) return
+        val s = player?.playbackParameters?.speed ?: prefs.playbackSpeed
+        val show = kotlin.math.abs(s - 1f) > 0.01f
+        speedBadge.text = speedLabel(s)
+        speedBadge.visibility = if (show) View.VISIBLE else View.GONE
     }
 
     private fun updateProgress() {
         val p = player ?: return
         val dur = p.duration
+        // 连续快进时进度条要跟着目标点走，否则按三下右键、条子才挪一下
+        val pos = if (pendingSeek >= 0) pendingSeek else p.currentPosition
         if (dur > 0) {
-            seekBar.progress = (p.currentPosition * 1000 / dur).toInt().coerceIn(0, 1000)
-            // 已缓冲部分用白色画在蓝色之后（secondaryProgress）
+            seekBar.progress = (pos * 1000 / dur).toInt().coerceIn(0, 1000)
+            // 已缓冲部分画在已播放之后（secondaryProgress）
             seekBar.secondaryProgress = (p.bufferedPosition * 1000 / dur).toInt().coerceIn(0, 1000)
-            timeText.text = formatTime(p.currentPosition) + " / " + formatTime(dur)
+            timeText.text = formatTime(pos) + " / " + formatTime(dur)
         } else {
             seekBar.progress = 0
             seekBar.secondaryProgress = 0
-            timeText.text = formatTime(p.currentPosition) + " / --:--"
+            timeText.text = formatTime(pos) + " / --:--"
         }
         updatePlayPauseIcon()
     }
@@ -445,7 +681,7 @@ class PlayerActivity : Activity() {
         val bmp = android.graphics.Bitmap.createBitmap(size, size, android.graphics.Bitmap.Config.ARGB_8888)
         val c = android.graphics.Canvas(bmp)
         val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-            color = android.graphics.Color.parseColor("#e5e7eb")
+            color = Ui.TEXT
             style = android.graphics.Paint.Style.FILL
         }
         if (paused) {
@@ -486,7 +722,7 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(hideUi)
         handler.removeCallbacks(uiTick)
         handler.post(uiTick)
-        if (!isActionBarVisible()) {
+        if (!isActionBarVisible() && !pickerVisible) {
             handler.postDelayed(hideUi, HIDE_UI_DELAY_MS)
         }
         updateChrome()
@@ -505,6 +741,7 @@ class PlayerActivity : Activity() {
 
     /** 下键 / 菜单键：呼出操作栏，焦点落到第一个按钮 */
     private fun showActions() {
+        if (pickerVisible) return
         setActionBarVisible(true)
         progressRow.visibility = View.VISIBLE
         handler.removeCallbacks(hideUi)
@@ -520,23 +757,40 @@ class PlayerActivity : Activity() {
         handler.postDelayed(hideActions, HIDE_ACTIONS_DELAY_MS)
     }
 
+    /**
+     * 收起操作栏，控制条退到「只显示进度条」的中间态 —— 也就是按 OK 暂停后那种状态，
+     * 4 秒后由 hideUi 把进度条和标题一起收掉。
+     *
+     * 之前的 bug：菜单键/返回键收起操作栏时只藏了操作栏，而 hideUi 在 showActions()
+     * 里被移除后没人再排上，进度条和标题从此常驻屏幕（6 秒超时路径同样中招）。
+     */
+    private fun collapseToProgress() {
+        setActionBarVisible(false)
+        progressRow.visibility = View.VISIBLE
+        handler.removeCallbacks(hideActions)
+        handler.removeCallbacks(uiTick)
+        handler.post(uiTick)
+        handler.removeCallbacks(hideUi)
+        handler.postDelayed(hideUi, HIDE_UI_DELAY_MS)
+        updateChrome()
+    }
+
     private fun actionButton(label: String, onClick: () -> Unit): TextView = TextView(this).apply {
         text = label
-        setTextColor(0xFFE5E7EB.toInt())
+        setTextColor(Ui.TEXT)
         setTextSize(14f)
-        setPadding(dp(22), dp(12), dp(22), dp(12))
-        val normal = android.graphics.drawable.GradientDrawable().apply {
-            setColor(0xFF2B3A52.toInt())
-            cornerRadius = dp(8).toFloat()
-        }
-        val focused = android.graphics.drawable.GradientDrawable().apply {
-            setColor(0xFF3E7FD4.toInt())
-            cornerRadius = dp(8).toFloat()
-        }
+        setPadding(dp(20), dp(11), dp(20), dp(11))
+        // 常态深色胶囊，聚焦 = 亮蓝填充 + 深色文字。
+        // 视频画面上背景是黑的，反色比细描边更容易在 3 米外看清焦点。
+        val normal = Ui.bg(this@PlayerActivity, 0xFF26344A.toInt(), Ui.R_BTN)
+        val focused = Ui.bg(this@PlayerActivity, Ui.ACCENT, Ui.R_BTN, 0, 2, Ui.BRIGHT)
         background = normal
         isFocusable = true
         isFocusableInTouchMode = true
-        setOnFocusChangeListener { v, has -> v.background = if (has) focused else normal }
+        setOnFocusChangeListener { v, has ->
+            v.background = if (has) focused else normal
+            (v as TextView).setTextColor(if (has) Ui.ON_ACCENT else Ui.TEXT)
+        }
         setOnClickListener { onClick() }
         val lp = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -554,6 +808,20 @@ class PlayerActivity : Activity() {
         if (!::speedActionBtn.isInitialized) return
         val s = player?.playbackParameters?.speed ?: prefs.playbackSpeed
         speedActionBtn.text = "倍速 " + speedLabel(s)
+        updateSpeedBadge()
+    }
+
+    /** 把当前值写进按钮标签：不点开菜单也知道现在是「自动解码、适应屏幕」 */
+    private fun decodeLabel(): String = "解码 " + when (prefs.decodeMode) {
+        1 -> "软解"
+        2 -> "硬解"
+        else -> "自动"
+    }
+
+    private fun aspectLabel(): String = "画幅 " + when (aspectMode) {
+        1 -> "裁切"
+        2 -> "拉伸"
+        else -> "适应"
     }
 
     private fun showSpeedMenu() {
@@ -581,6 +849,7 @@ class PlayerActivity : Activity() {
             .setTitle("解码方式（下次打开视频生效）")
             .setSingleChoiceItems(names, prefs.decodeMode.coerceIn(0, 2)) { d, which ->
                 prefs.decodeMode = which
+                decodeActionBtn.text = decodeLabel()
                 d.dismiss()
                 toast("已设为：${names[which]}，重新打开视频生效")
             }
@@ -599,6 +868,7 @@ class PlayerActivity : Activity() {
                     2 -> AspectRatioFrameLayout.RESIZE_MODE_FILL
                     else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
                 }
+                aspectActionBtn.text = aspectLabel()
                 d.dismiss()
             }
             .setNegativeButton("取消", null)
@@ -635,6 +905,19 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(clearPendingSeek)
         handler.postDelayed(clearPendingSeek, 1_500)
         showProgress()
+        flashSeekHint(target, deltaMs)
+    }
+
+    /** 快进/快退时在屏幕正中给出「跳了多少、落到几分几秒」——底部小字 3 米外看不清 */
+    private fun flashSeekHint(targetMs: Long, deltaMs: Long) {
+        if (!::seekHint.isInitialized) return
+        val secs = kotlin.math.abs(deltaMs) / 1000
+        val arrow = if (deltaMs >= 0) "▶▶" else "◀◀"
+        val action = if (deltaMs >= 0) "快进" else "快退"
+        seekHint.text = "$arrow  $action $secs 秒    " + formatTime(targetMs)
+        seekHint.visibility = View.VISIBLE
+        handler.removeCallbacks(hideSeekHint)
+        handler.postDelayed(hideSeekHint, 900L)
     }
 
     private fun currentUrl(): String = urls.getOrNull(currentIndex).orEmpty()
@@ -665,9 +948,17 @@ class PlayerActivity : Activity() {
         }
     }
 
+    /** 超过一小时要显示 1:23:20，否则「83:20」这种分钟数会让人读不出来 */
     private fun formatTime(ms: Long): String {
-        val total = ms / 1000
-        return "%d:%02d".format(total / 60, total % 60)
+        val total = ms.coerceAtLeast(0L) / 1000
+        val h = total / 3600
+        val m = (total % 3600) / 60
+        val s = total % 60
+        return if (h > 0) {
+            String.format(java.util.Locale.US, "%d:%02d:%02d", h, m, s)
+        } else {
+            String.format(java.util.Locale.US, "%d:%02d", m, s)
+        }
     }
 
     private fun hideSystemUi() {
@@ -683,6 +974,18 @@ class PlayerActivity : Activity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        // 选集面板打开时：返回键收起，其余（方向键 / OK）全部交给网格
+        if (pickerVisible) {
+            if (event.action == KeyEvent.ACTION_DOWN &&
+                (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_MENU ||
+                    keyCode == KeyEvent.KEYCODE_M)
+            ) {
+                hideEpisodePicker()
+                return true
+            }
+            return super.onKeyDown(keyCode, event)
+        }
+
         val p = player ?: return super.onKeyDown(keyCode, event)
 
         // 操作栏打开时：按键全部交给菜单（按钮可聚焦、可点击）
@@ -695,12 +998,12 @@ class PlayerActivity : Activity() {
                     KeyEvent.KEYCODE_MENU,
                     KeyEvent.KEYCODE_M,
                     -> {
-                        hideActions.run()
+                        collapseToProgress()
                         return true
                     }
                     KeyEvent.KEYCODE_DPAD_DOWN -> {
                         // 已经在操作栏上，再按下键就收起
-                        hideActions.run()
+                        collapseToProgress()
                         return true
                     }
                 }
@@ -728,20 +1031,21 @@ class PlayerActivity : Activity() {
                 showActions()
                 true
             }
+            // 步长取自「播放设置」：原来这里写死 10/15 秒，那个设置项其实一直是失效的
             KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                seekBy(if (event.repeatCount > 0) 15_000L else 10_000L)
+                seekBy(seekStepMs)
                 true
             }
             KeyEvent.KEYCODE_DPAD_LEFT -> {
-                seekBy(if (event.repeatCount > 0) -15_000L else -10_000L)
+                seekBy(-seekStepMs)
                 true
             }
             KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
-                seekBy(30_000L)
+                seekBy(seekStepMs * 3)
                 true
             }
             KeyEvent.KEYCODE_MEDIA_REWIND -> {
-                seekBy(-30_000L)
+                seekBy(-seekStepMs * 3)
                 true
             }
             KeyEvent.KEYCODE_MEDIA_NEXT -> {
@@ -775,6 +1079,8 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(speedTick)
         handler.removeCallbacks(hideActions)
         handler.removeCallbacks(clearPendingSeek)
+        handler.removeCallbacks(hideSeekHint)
+        handler.removeCallbacks(hideTitle)
         player?.release()
         player = null
         super.onDestroy()
