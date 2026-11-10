@@ -3287,6 +3287,22 @@ class MainActivity : Activity() {
     private fun play(url: String, title: String, isLive: Boolean = false) =
         playFromList(listOf(url), 0, title, isLive = isLive)
 
+    /**
+     * 直播：把整个频道列表交给播放器，而不是只传当前这一个。
+     * 播放器据此提供「上一频道 / 下一频道」，切台时不用退回列表重选。
+     */
+    private fun playLive(channels: List<Channel>, index: Int) {
+        if (channels.isEmpty()) return
+        val idx = index.coerceIn(0, channels.lastIndex)
+        playFromList(
+            urls = channels.map { it.url },
+            index = idx,
+            title = channels[idx].name,
+            isLive = true,
+            itemTitles = channels.map { it.name },
+        )
+    }
+
     /** 整季播放：把整个集数列表交给播放器，一集放完自动进下一集 */
     private fun playFromList(
         urls: List<String>,
@@ -3295,6 +3311,7 @@ class MainActivity : Activity() {
         cover: String = "",
         fromStart: Boolean = false,
         isLive: Boolean = false,
+        itemTitles: List<String> = emptyList(),
     ) {
         if (urls.isEmpty()) return
         // 直播统一走服务端代理：地方台直连经常被地区限制或断流，网页版就是靠代理播的
@@ -3302,6 +3319,10 @@ class MainActivity : Activity() {
         startActivity(Intent(this, PlayerActivity::class.java).apply {
             putStringArrayListExtra(PlayerActivity.EXTRA_URLS, ArrayList(finalUrls))
             if (isLive) putExtra(PlayerActivity.EXTRA_COOKIE, api.sessionCookie)
+            // 每一集/每个频道各自的标题：切台后片名要跟着变，不能一直显示进来时的那个
+            if (itemTitles.isNotEmpty()) {
+                putStringArrayListExtra(PlayerActivity.EXTRA_ITEM_TITLES, ArrayList(itemTitles))
+            }
             putExtra(PlayerActivity.EXTRA_INDEX, index.coerceIn(0, urls.size - 1))
             putExtra(PlayerActivity.EXTRA_TITLE, title)
             putExtra(PlayerActivity.EXTRA_COVER, cover)
@@ -3435,7 +3456,7 @@ class MainActivity : Activity() {
                 }
                 val ch = liveSorted[position]
                 tv.text = liveRowLabel(ch)
-                tv.setOnClickListener { play(ch.url, ch.name, isLive = true) }
+                tv.setOnClickListener { playLive(liveSorted, position) }
                 applyFocusStyle(tv, Color.TRANSPARENT, tv)
                 return tv
             }
@@ -3454,8 +3475,7 @@ class MainActivity : Activity() {
             liveSorted.getOrNull(pos)?.let { child?.text = liveRowLabel(it) }
         }
         listView.setOnItemClickListener { _, _, position, _ ->
-            val ch = liveSorted.getOrNull(position) ?: return@setOnItemClickListener
-            play(ch.url, ch.name, isLive = true)
+            playLive(liveSorted, position)
         }
         listView.setOnKeyListener { v, keyCode, event ->
             if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
@@ -3466,8 +3486,7 @@ class MainActivity : Activity() {
             when {
                 // 有些遥控器的 OK 不走 onItemClick，这里兜一下
                 isOk -> {
-                    val ch = liveSorted.getOrNull(pos) ?: return@setOnKeyListener false
-                    play(ch.url, ch.name, isLive = true)
+                    playLive(liveSorted, pos)
                     true
                 }
                 keyCode == KeyEvent.KEYCODE_DPAD_RIGHT -> {

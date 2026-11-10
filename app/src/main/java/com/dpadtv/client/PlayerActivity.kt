@@ -63,6 +63,9 @@ class PlayerActivity : Activity() {
         /** 直播走服务端代理时要带的会话 cookie */
         const val EXTRA_COOKIE = "cookie"
 
+        /** 每一集 / 每个频道各自的标题，切台后片名跟着变 */
+        const val EXTRA_ITEM_TITLES = "item_titles"
+
         private const val SAVE_INTERVAL_MS = 5_000L
         private const val HIDE_UI_DELAY_MS = 4_000L
         private const val HIDE_ACTIONS_DELAY_MS = 6_000L
@@ -92,6 +95,7 @@ class PlayerActivity : Activity() {
     private lateinit var prefs: Prefs
 
     private var urls: List<String> = emptyList()
+    private var itemTitles: List<String> = emptyList()
     private var currentIndex = 0
     private var seriesTitle = ""
     private var baseText = ""
@@ -175,6 +179,7 @@ class PlayerActivity : Activity() {
         urls = intent.getStringArrayListExtra(EXTRA_URLS)?.toList().orEmpty()
         currentIndex = intent.getIntExtra(EXTRA_INDEX, 0).coerceIn(0, (urls.size - 1).coerceAtLeast(0))
         seriesTitle = intent.getStringExtra(EXTRA_TITLE).orEmpty()
+        itemTitles = intent.getStringArrayListExtra(EXTRA_ITEM_TITLES)?.toList().orEmpty()
         coverUrl = intent.getStringExtra(EXTRA_COVER).orEmpty()
         fromStart = intent.getBooleanExtra(EXTRA_FROM_START, false)
         isLive = intent.getBooleanExtra(EXTRA_IS_LIVE, false)
@@ -289,26 +294,42 @@ class PlayerActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         if (urls.size > 1) {
-            actionBar.addView(actionButton("选集") { showEpisodePicker() })
-            actionBar.addView(actionButton("上集") {
-                if (player?.hasPreviousMediaItem() == true) {
-                    player?.seekToPreviousMediaItem()
-                } else {
-                    toast("已是第一集")
-                }
-                showActions()
-            })
-            actionBar.addView(actionButton("下集") {
-                if (player?.hasNextMediaItem() == true) {
-                    player?.seekToNextMediaItem()
-                } else {
-                    toast("已是最后一集")
-                }
-                showActions()
-            })
+            if (isLive) {
+                // 直播没有「集」，逐项就是频道。选集面板也不给：频道列表在直播页，
+                // 播放器里只需要前后切
+                actionBar.addView(actionButton("上一频道") {
+                    switchLiveChannel(-1)
+                    showActions()
+                })
+                actionBar.addView(actionButton("下一频道") {
+                    switchLiveChannel(1)
+                    showActions()
+                })
+            } else {
+                actionBar.addView(actionButton("选集") { showEpisodePicker() })
+                actionBar.addView(actionButton("上集") {
+                    if (player?.hasPreviousMediaItem() == true) {
+                        player?.seekToPreviousMediaItem()
+                    } else {
+                        toast("已是第一集")
+                    }
+                    showActions()
+                })
+                actionBar.addView(actionButton("下集") {
+                    if (player?.hasNextMediaItem() == true) {
+                        player?.seekToNextMediaItem()
+                    } else {
+                        toast("已是最后一集")
+                    }
+                    showActions()
+                })
+            }
         }
-        speedActionBtn = actionButton("倍速 X1.00") { showSpeedMenu() }
-        actionBar.addView(speedActionBtn)
+        // 直播不生成倍速按钮：直播流倍速没有意义（有些台还会因此音画不同步/直接断）
+        if (!isLive) {
+            speedActionBtn = actionButton("倍速 X1.00") { showSpeedMenu() }
+            actionBar.addView(speedActionBtn)
+        }
         decodeActionBtn = actionButton(decodeLabel()) { showDecodeMenu() }
         actionBar.addView(decodeActionBtn)
         aspectActionBtn = actionButton(aspectLabel()) { showAspectMenu() }
@@ -451,7 +472,8 @@ class PlayerActivity : Activity() {
             .build()
             .also { exo ->
                 playerView.player = exo
-                exo.setPlaybackSpeed(prefs.playbackSpeed)
+                // 直播恒为 1.0：上回点播开的 1.5 倍不该带到直播里
+                exo.setPlaybackSpeed(if (isLive) 1f else prefs.playbackSpeed)
                 exo.pauseAtEndOfMediaItems = !prefs.autoNext
 
                 exo.addListener(object : Player.Listener {
@@ -499,10 +521,8 @@ class PlayerActivity : Activity() {
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
-                        // 直播断流很常见（分片 404、切片边缘、临时网络抖动）：先自动重连几次，
-                        // 别一上来就盖一层「播放失败」的红字
                         // 直播断流很常见（分片 404、切片边缘、临时抖动）：
-                        // 前三次失败先静默重连，之后每次提示一下，最多 8 次；
+                        // 先静默重连几次，从第二次起提示，最多 8 次；
                         // 只有非 IO 类错误（解码失败等）才立刻报错
                         if (isLive && error.errorCodeName.contains("ERROR_CODE_IO") && liveRetry < 8) {
                             liveRetry++
@@ -510,7 +530,9 @@ class PlayerActivity : Activity() {
                             val delay = (800L * liveRetry).coerceAtMost(5_000L)
                             handler.postDelayed({
                                 val p = player ?: return@postDelayed
-                                p.setMediaItem(liveItem(currentUrl()))
+                                // 只重新准备当前 item。不能 setMediaItem：
+                                // 那会把整条频道列表替换成单条，currentIndex 归零、
+                                // 片名跳回第一个台，上一/下一频道也随之失效
                                 p.prepare()
                                 p.playWhenReady = true
                             }, delay)
@@ -519,13 +541,14 @@ class PlayerActivity : Activity() {
                         val msg = when {
                             error.errorCodeName.contains("DECODER", true) ->
                                 "解码失败：这个片源可能是 H.265 / 不支持的编码"
-                            // 直播重试 8 次都连不上，基本就是台挂了/被地区限制，别甩错误码给用户
-                            isLive ->
-                                "这个频道连不上（已重连 8 次）· 按返回键换个台"
+                            // 直播重试 8 次都连不上，基本就是台挂了/被地区限制，别甩错误码给用户。
+                            // 带上频道名，用户才知道是哪个台的问题，切走了也认得回来
+                            isLive -> "${nameOf(currentIndex)} 连不上 · 按左右键换台"
                             else -> "播放失败：${error.errorCodeName}"
                         }
                         hasError = true
-                        baseText = "$msg  ·  按菜单键换集或换源"
+                        // 直播已经有左右键切台，不再提「按菜单键换集」
+                        baseText = if (isLive) msg else "$msg  ·  按菜单键换集或换源"
                         titleText.text = baseText
                         titleText.setTextColor(Ui.DANGER)
                         bufferingBox.visibility = View.GONE
@@ -551,7 +574,7 @@ class PlayerActivity : Activity() {
             }
 
         updateSpeedAction()
-        if (kotlin.math.abs(prefs.playbackSpeed - 1f) > 0.01f) {
+        if (!isLive && kotlin.math.abs(prefs.playbackSpeed - 1f) > 0.01f) {
             toast("当前倍速 ${speedLabel(prefs.playbackSpeed)}（在上键菜单里可改回 X1.00）")
         }
         handler.postDelayed(saveTick, SAVE_INTERVAL_MS)
@@ -703,6 +726,11 @@ class PlayerActivity : Activity() {
 
     private fun updateSpeedBadge() {
         if (!::speedBadge.isInitialized) return
+        // 直播恒 1.0，不显示倍速角标
+        if (isLive) {
+            speedBadge.visibility = View.GONE
+            return
+        }
         val s = player?.playbackParameters?.speed ?: prefs.playbackSpeed
         val show = kotlin.math.abs(s - 1f) > 0.01f
         speedBadge.text = speedLabel(s)
@@ -711,6 +739,15 @@ class PlayerActivity : Activity() {
 
     private fun updateProgress() {
         val p = player ?: return
+        if (isLive) {
+            // 直播没有可跳转的时间轴：不画进度条，时间位改成「直播」。
+            // 之前这里显示的是 m3u8 滑动窗口的长度（0:00/0:09），看着像能拖
+            seekBar.visibility = View.GONE
+            timeText.text = "直播"
+            updatePlayPauseIcon()
+            return
+        }
+        seekBar.visibility = View.VISIBLE
         val dur = p.duration
         // 连续快进时进度条要跟着目标点走，否则按三下右键、条子才挪一下
         val pos = if (pendingSeek >= 0) pendingSeek else p.currentPosition
@@ -986,8 +1023,41 @@ class PlayerActivity : Activity() {
     private fun currentUrl(): String = urls.getOrNull(currentIndex).orEmpty()
 
     private fun labelFor(index: Int): String {
+        // 有逐项标题（直播的频道名 / 分集标题）时优先用它，切台后片名才会跟着变
+        val own = itemTitles.getOrNull(index)?.takeIf { it.isNotBlank() }
+        if (own != null) {
+            return if (urls.size > 1) "$own · ${index + 1}/${urls.size}" else own
+        }
         if (urls.size <= 1) return seriesTitle.ifEmpty { "正在播放" }
         return "$seriesTitle · 第 ${index + 1}/${urls.size} 集"
+    }
+
+    /** 列表里某一项的纯名字（不加序号），切台 toast 用 */
+    private fun nameOf(index: Int): String =
+        itemTitles.getOrNull(index)?.takeIf { it.isNotBlank() } ?: seriesTitle
+
+    /**
+     * 直播切台。播放列表在直播场景下就是频道列表（MainActivity.playLive 传的整表），
+     * 所以直接 seekTo + prepare 即可；切台后重试计数清零，别把上一个台的失败次数带过来。
+     */
+    private fun switchLiveChannel(delta: Int) {
+        val p = player ?: return
+        val target = currentIndex + delta
+        if (target !in urls.indices) {
+            toast(if (delta > 0) "已是最后一个频道" else "已是第一个频道")
+            return
+        }
+        liveRetry = 0
+        hasError = false
+        titleText.setTextColor(Ui.TEXT)
+        // 只 seekTo：播放器已 prepared，切 item 会自动重新准备。
+        // 再补一次 prepare() 会把刚发起的加载取消掉重建，HLS 加载器会抛
+        // UnexpectedLoaderException: IllegalArgumentException（表面又是「流中断」）
+        p.playWhenReady = true
+        p.seekTo(target, 0L)
+        bufferingBox.visibility = View.VISIBLE
+        toast(if (delta > 0) "下一个频道：${nameOf(target)}" else "上一个频道：${nameOf(target)}")
+        showProgress()
     }
 
     private fun persistProgress() {
@@ -1085,7 +1155,13 @@ class PlayerActivity : Activity() {
                 true
             }
             KeyEvent.KEYCODE_DPAD_UP -> {
-                showSpeedMenu()
+                // 直播没有倍速：上键和一众「呼出操作栏」的键一样用
+                if (isLive) {
+                    showActions()
+                    toast("直播不支持倍速")
+                } else {
+                    showSpeedMenu()
+                }
                 true
             }
             KeyEvent.KEYCODE_DPAD_DOWN -> {
@@ -1097,20 +1173,21 @@ class PlayerActivity : Activity() {
                 true
             }
             // 步长取自「播放设置」：原来这里写死 10/15 秒，那个设置项其实一直是失效的
+            // 直播不能跳转（没有可比对的时间轴），左右键改成切台，正好对上电视遥控器的习惯
             KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                seekBy(seekStepMs)
+                if (isLive) switchLiveChannel(1) else seekBy(seekStepMs)
                 true
             }
             KeyEvent.KEYCODE_DPAD_LEFT -> {
-                seekBy(-seekStepMs)
+                if (isLive) switchLiveChannel(-1) else seekBy(-seekStepMs)
                 true
             }
             KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
-                seekBy(seekStepMs * 3)
+                if (isLive) switchLiveChannel(1) else seekBy(seekStepMs * 3)
                 true
             }
             KeyEvent.KEYCODE_MEDIA_REWIND -> {
-                seekBy(-seekStepMs * 3)
+                if (isLive) switchLiveChannel(-1) else seekBy(-seekStepMs * 3)
                 true
             }
             KeyEvent.KEYCODE_MEDIA_NEXT -> {
