@@ -773,20 +773,28 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun newList(): ListView = ListView(this).apply {
+    private fun newList(dividers: Boolean = true): ListView = ListView(this).apply {
         isFocusable = true
         isFocusableInTouchMode = true
-        setSelector(listSelector())
-        // 行间细分割线：片源/历史这类长列表没有分隔会糊成一片
-        divider = android.graphics.drawable.ColorDrawable(Ui.STROKE)
-        dividerHeight = dp(1)
-        // AdapterView 会把选中高亮一直留着，焦点移走后就变成「永远是聚焦状态」。
-        // 失焦时把 selector 换成透明，重新聚焦再装回来。
+        // 行间细分割线：纯文字列表（搜索历史、按钮排序）没有分隔会糊成一片。
+        // 卡片式的列表（片源管理、添加片源）每行自带底色和描边，再加线就重复了，传 false。
+        if (dividers) {
+            divider = android.graphics.drawable.ColorDrawable(Ui.STROKE)
+            dividerHeight = dp(1)
+        } else {
+            divider = null
+            dividerHeight = 0
+        }
+        // 焦点环只靠 ListView 自己的 selector 状态绘制：AbsListView.shouldShowSelector()
+        // 本身就要求 hasFocus()，失焦后不会再画，**不需要**在焦点变化时替换 selector。
+        // 之前那版在 OnFocusChangeListener 里调 setSelector()，而 AbsListView.setSelector()
+        // 会 requestLayout() —— 焦点一进列表就整页重排一次，观感上是列表「抖一下」（实测
+        // 列表顶边 284→282→284 闪一帧）。这里保持同一个 selector 实例，只在重绘时切状态。
+        val ring = listSelector()
+        setSelector(ring)
         setOnFocusChangeListener { v, hasFocus ->
-            (v as ListView).setSelector(
-                if (hasFocus) listSelector()
-                else android.graphics.drawable.ColorDrawable(Color.TRANSPARENT),
-            )
+            // 只改 drawable 的 alpha，不触发 requestLayout（setSelector 才会重排）
+            ring.alpha = if (hasFocus) 255 else 0
             v.invalidate()
         }
     }
@@ -1774,7 +1782,8 @@ class MainActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(1, 0, 1f)
             })
         } else {
-            val listView = newList()
+            // 每行是带底色描边的卡片，不需要分割线
+            val listView = newList(dividers = false)
             listView.adapter = object : BaseAdapter() {
                 override fun getCount(): Int = sources.size
 
@@ -1787,7 +1796,7 @@ class MainActivity : Activity() {
                     val wrap = (convertView as? LinearLayout)
                         ?: LinearLayout(this@MainActivity).apply {
                             orientation = LinearLayout.VERTICAL
-                            setPadding(0, dp(3), 0, dp(3))
+                            setPadding(dp(3), dp(3), dp(3), dp(3))
                         }
                     wrap.removeAllViews()
                     wrap.addView(sourceRow(sources[position], position))
@@ -1840,8 +1849,10 @@ class MainActivity : Activity() {
      * 片源列表的一行：序号 + 名称/地址 + 右侧状态。
      *
      * 序号不是装饰 —— 列表顺序就是搜索时逐个请求的顺序，用户上移/下移时需要看得见结果。
-     * 状态里带上「多少条」而不是毫秒：`Api.testSource` 返回的第二个值是结果条数，
-     * 老代码把它当毫秒显示成「可用 · 320ms」，是标错了单位。
+     *
+     * 状态只说「可用 / 不可用」，不再带条数。`Api.testSource` 返回的第二个值是测试请求
+     * 拿到的条目数，它既不是片库大小、也不等于实际能搜到多少（实测：某源搜「我」有 100 条，
+     * 测试却返回 0），挂在状态后面只会让人误判。原文案还一度把它当毫秒显示成「可用 · 320ms」。
      */
     private fun sourceRow(s: SourceConfig, index: Int): LinearLayout {
         val row = LinearLayout(this).apply {
@@ -1881,7 +1892,7 @@ class MainActivity : Activity() {
             testingUrls.contains(s.url) -> "测试中…"
             !s.enabled -> "已停用"
             r == null -> "未测试"
-            r.first -> "可用 · ${r.second} 条"
+            r.first -> "可用"
             else -> "不可用"
         }
         val color = when {
@@ -1968,13 +1979,16 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 「真实可用」的判定：启用中 + 最近一次连通性测试成功 + 测试时真搜出了条目。
-     * 测试出的条数 > 0 才算 —— 只回包但 0 结果的源，搜索时同样出不了货。
+     * 「真实可用」的判定：启用中 + 最近一次连通性测试成功。
+     *
+     * 不再要求测试条数 > 0：那个条数是服务端探一次拿回的样本量，和「这个源能不能出货」
+     * 不是一回事（实测某源搜「我」能出 100 条，测试却返回 0）。用条数做闸门会把好源误杀，
+     * 也让列表里「可用」的行和顶栏「可用 N」对不上。
      */
     private fun isUsableSource(s: SourceConfig): Boolean {
         if (!s.enabled) return false
         val t = prefs.sourceTest(s.url) ?: return false
-        return t.first && t.second > 0
+        return t.first
     }
 
     /** 清空全部片源：不可撤销的操作，必须二次确认并说清楚影响范围 */
@@ -2147,7 +2161,7 @@ class MainActivity : Activity() {
     private fun testSource(s: SourceConfig) {
         runApi("正在测试「${s.name}」…", { api.testSource(s.url) }, { r ->
             toast(
-                if (r.first) "「${s.name}」可用，返回 ${r.second} 个结果"
+                if (r.first) "「${s.name}」可用"
                 else "「${s.name}」不可用（HTTP ${r.second}）",
             )
         })
@@ -2218,7 +2232,7 @@ class MainActivity : Activity() {
         col.addView(topBar("添加片源", back = { showSources() }))
         col.addView(hintText("越靠上越省事 · 导入按地址去重追加，重复导入不会产生重复项"))
 
-        val listView = newList()
+        val listView = newList(dividers = false)
         listView.adapter = object : BaseAdapter() {
             override fun getCount(): Int = options.size
 
@@ -2230,7 +2244,7 @@ class MainActivity : Activity() {
                 val wrap = (convertView as? LinearLayout)
                     ?: LinearLayout(this@MainActivity).apply {
                         orientation = LinearLayout.VERTICAL
-                        setPadding(0, dp(3), 0, dp(3))
+                        setPadding(dp(3), dp(3), dp(3), dp(3))
                     }
                 wrap.removeAllViews()
                 val (title, desc, _) = options[position]
