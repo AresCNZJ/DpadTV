@@ -185,6 +185,9 @@ class PlayerActivity : Activity() {
         isLive = intent.getBooleanExtra(EXTRA_IS_LIVE, false)
         cookieHeader = intent.getStringExtra(EXTRA_COOKIE).orEmpty()
         seekStepMs = prefs.seekStepSeconds.coerceIn(5, 120) * 1000L
+        if (com.dpadtv.client.BuildConfig.DEBUG) {
+            android.util.Log.d("DpadTV", "onCreate urls=$urls live=$isLive cookie=${cookieHeader.isNotEmpty()}")
+        }
 
         val root = FrameLayout(this)
         root.setBackgroundColor(android.graphics.Color.BLACK)
@@ -437,8 +440,17 @@ class PlayerActivity : Activity() {
             return
         }
 
+        // 直播和点播的缓冲目标不能共用一套。点播 20s/60s 是「多缓一点更稳」，
+        // 但芒果这类直播 HLS 的窗口只有 3 个分片（6 秒一段 ≈ 18 秒）：
+        // 缓冲目标比整个窗口还大，播放器永远追不上，还得被窗口一路推着走。
+        // 直播改成小缓冲（约两个分片），贴着直播边缘走，回边/换台也更快。
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(20_000, 60_000, 1_500, 3_000)
+            .setBufferDurationsMs(
+                if (isLive) 3_000 else 20_000,
+                if (isLive) 15_000 else 60_000,
+                if (isLive) 800 else 1_500,
+                if (isLive) 1_500 else 3_000,
+            )
             .build()
 
         // 分片级磁盘缓存：看过的片段落盘，回拖/重看不再重复下载
@@ -463,7 +475,18 @@ class PlayerActivity : Activity() {
         // 表现出来就是正在看的时候突然 ERROR_CODE_IO_UNSPECIFIED
         val mediaSourceFactory = androidx.media3.exoplayer.source.DefaultMediaSourceFactory(
             if (isLive) MeteredDataSource.Factory(httpFactory, netSpeedMeter) else cacheFactory,
-        )
+        ).apply {
+            if (isLive) {
+                // HlsMediaSource 默认把播放起点放在「窗口最老端 + 3×分片时长」，
+                // 6 秒分片就是 18 秒 —— 恰好是短窗口的全部内容。一刷新清单就掉出窗口。
+                // 改成离直播边缘 2 秒，并允许以 1.5 倍速追赶、0.9 倍速退让
+                setLiveTargetOffsetMs(2_000L)
+                setLiveMinOffsetMs(1_000L)
+                setLiveMaxOffsetMs(8_000L)
+                setLiveMinSpeed(0.9f)
+                setLiveMaxSpeed(1.5f)
+            }
+        }
 
         player = ExoPlayer.Builder(this)
             .setLoadControl(loadControl)
@@ -475,6 +498,11 @@ class PlayerActivity : Activity() {
                 // 直播恒为 1.0：上回点播开的 1.5 倍不该带到直播里
                 exo.setPlaybackSpeed(if (isLive) 1f else prefs.playbackSpeed)
                 exo.pauseAtEndOfMediaItems = !prefs.autoNext
+                // 调试包挂 EventLogger：直播这种短窗口源出问题时，光一个错误码没法定位，
+                // 得知道出错前发生了什么（清单刷新 / 分片加载 / 时间轴变化 / seek）。
+                if (com.dpadtv.client.BuildConfig.DEBUG) {
+                    exo.addAnalyticsListener(androidx.media3.exoplayer.util.EventLogger())
+                }
 
                 exo.addListener(object : Player.Listener {
                     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -521,23 +549,38 @@ class PlayerActivity : Activity() {
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
-                        // 直播断流很常见（分片 404、切片边缘、临时抖动）：
-                        // 先静默重连几次，从第二次起提示，最多 8 次；
-                        // 只有非 IO 类错误（解码失败等）才立刻报错
-                        if (isLive && error.errorCodeName.contains("ERROR_CODE_IO") && liveRetry < 8) {
+                        // 直播的错误基本都不是「台挂了」，而是分片层面的问题（短窗口滑走、
+                        // 某个分片的编码数据让解析器翻车、临时抖动）。处理原则只有一条：
+                        // 尽快回到直播边缘继续播，别把画面停在错误页上。
+                        //
+                        // 这里最容易搞错的是重连方式：只调 prepare() 会从「出错的那个位置」
+                        // 重新来一遍，而坏分片每次都在同一个位置炸 —— 于是原地重试变成死循环，
+                        // 用户看到的就是「一直在重连、就是连不上」。所以必须先 seekToDefaultPosition()
+                        // 把位置挪到直播边缘，换个分片重来。
+                        if (isLive && !error.errorCodeName.contains("DECODER", true)) {
+                            if (liveRetry >= 8) {
+                                showPlaybackError(error)
+                                return
+                            }
                             liveRetry++
-                            if (liveRetry >= 2) toast("直播流中断，正在重连（$liveRetry/8）…")
-                            val delay = (800L * liveRetry).coerceAtMost(5_000L)
+                            // 前两次几乎无感（用户顶多看到一下缓冲圈），从第三次起才提示
+                            if (liveRetry >= 3) toast("直播不稳，正在重连（$liveRetry/8）…")
+                            val delay = if (liveRetry == 1) 250L else (600L * liveRetry).coerceAtMost(4_000L)
                             handler.postDelayed({
                                 val p = player ?: return@postDelayed
-                                // 只重新准备当前 item。不能 setMediaItem：
-                                // 那会把整条频道列表替换成单条，currentIndex 归零、
-                                // 片名跳回第一个台，上一/下一频道也随之失效
+                                // 不能 setMediaItem：那会把整条频道列表替换成单条，
+                                // currentIndex 归零、片名跳回第一个台，上一/下一频道也随之失效
                                 p.prepare()
+                                runCatching { p.seekToDefaultPosition() }
                                 p.playWhenReady = true
                             }, delay)
                             return
                         }
+                        showPlaybackError(error)
+                    }
+
+                    /** 直播重连次数用尽（或点播出错）：把错误摆到画面上 */
+                    private fun showPlaybackError(error: PlaybackException) {
                         val msg = when {
                             error.errorCodeName.contains("DECODER", true) ->
                                 "解码失败：这个片源可能是 H.265 / 不支持的编码"

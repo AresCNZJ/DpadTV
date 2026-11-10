@@ -26,7 +26,17 @@ class NetSpeedMeter(
 
     /** 一次网络 read：从 startMs 阻塞到 endMs，读到 bytes 字节 */
     fun add(bytes: Long, startMs: Long, endMs: Long) {
-        synchronized(lock) { samples.addLast(Sample(endMs, bytes, endMs - startMs)) }
+        synchronized(lock) {
+            samples.addLast(Sample(endMs, bytes, endMs - startMs))
+            // 写入时也裁一次窗口。bitsPerSecond() 只在控制条可见时才被调用，
+            // 直播这种一播几小时、控制条默认收着的场景下，样本会无界增长：
+            // 一次 read 一个样本（8KB 一块，2MB 分片就是 250 个），久了就是几十万对象，
+            // GC 抖起来正好表现为「播着播着卡一下」。
+            val cutoff = endMs - windowMs
+            while (samples.isNotEmpty() && samples.first().t < cutoff) {
+                samples.removeFirst()
+            }
+        }
     }
 
     /**
