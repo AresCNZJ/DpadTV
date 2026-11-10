@@ -64,6 +64,16 @@ class MainActivity : Activity() {
 
     /** 频道测活结果：url -> 能不能连上。换源时清空 */
     private val liveProbeResult = mutableMapOf<String, Boolean>()
+
+    /** 只看测活通过的频道 */
+    private var liveOnlyAlive = false
+
+    /** 收藏夹视图：不区分直播源，列出全部收藏 */
+    private var liveShowFavorites = false
+
+    /** 当前列表里显示的频道，收藏按钮要用它把「选中的那一行」翻回去 */
+    private var liveShown: List<Channel> = emptyList()
+    private var liveListView: ListView? = null
     private var mediaType = "movie"
     private var recommendPage = 0
     private var recommendTag = "热门"
@@ -823,7 +833,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun bindList(listView: ListView, items: List<String>, onItem: (Int) -> Unit) {
+    private fun bindList(listView: ListView, items: List<CharSequence>, onItem: (Int) -> Unit) {
         listView.adapter = simpleAdapter(items, onItem)
         listView.setOnItemClickListener { _, _, position, _ -> onItem(position) }
         // 有些遥控器/模拟器的 OK 键不走 onItemClick，这里显式兜底，保证按下去一定有反应
@@ -3299,12 +3309,25 @@ class MainActivity : Activity() {
     private fun showLive() {
         currentScreen = "live"
         val sources = prefs.liveSources()
-        if (sources.isEmpty()) {
+        if (sources.isEmpty() && !liveShowFavorites) {
             addLiveDialog()
             return
         }
-        val active = prefs.activeLiveUrl.ifEmpty { sources.first().url }
+        val active = prefs.activeLiveUrl.ifEmpty { sources.firstOrNull()?.url.orEmpty() }
         val activeLabel = sources.firstOrNull { it.url == active }?.label ?: "未命名"
+
+        // 收藏夹：不分直播源，直接铺收藏列表
+        if (liveShowFavorites) {
+            val favs = favoritesAsChannels()
+            renderLivePage(
+                shown = favs,
+                title = "收藏夹",
+                tail = if (favs.isEmpty()) "还没有收藏" else "${favs.size} 个频道 · 不分直播源",
+                activeLabel = activeLabel,
+            )
+            return
+        }
+
         if (liveChannelSource != active || liveChannels.isEmpty()) {
             runApi("正在加载频道…", { api.liveChannels(active) }, { list ->
                 liveChannels = list
@@ -3315,68 +3338,122 @@ class MainActivity : Activity() {
             return
         }
 
+        // 有的 m3u 没有 group-title（iptv-org 的 streams/cn.m3u 就是），服务端只能全给「其他」，
+        // 这种时候按频道名兜底归类，总比 500 行挤在一起强
+        val channels = if (hasUsableGroups()) liveChannels else liveChannels.map { c ->
+            c.copy(group = inferLiveGroup(c.name))
+        }
+        var shown = channels
+        if (liveGroupFilter.isNotEmpty()) shown = shown.filter { it.group == liveGroupFilter }
+        if (liveOnlyAlive) shown = shown.filter { liveProbeResult[it.url] == true }
+
+        val dead = liveProbeResult.count { !it.value }
+        val tail = buildString {
+            append("${shown.size}/${channels.size} 个频道")
+            if (liveProbeResult.isNotEmpty()) append(" · 死链 $dead")
+        }
+        renderLivePage(shown, "直播", tail, activeLabel)
+    }
+
+    /** 直播页统一的渲染：频道列表 + 顶部操作条，两种模式（当前源 / 收藏夹）共用 */
+    private fun renderLivePage(shown: List<Channel>, title: String, tail: String, activeLabel: String) {
+        liveShown = shown
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(40), dp(20), dp(40), dp(16))
         }
-        // 分组：有的 m3u 根本没带 group-title（比如 iptv-org 的 streams/cn.m3u），
-        // 服务端只能全部回落成「其他」。这种时候按频道名做个粗分类，总比 500 行一坨强
-        val channels = if (hasUsableGroups()) liveChannels else liveChannels.map { c ->
-            c.copy(group = inferLiveGroup(c.name))
-        }
-        val shown = if (liveGroupFilter.isEmpty()) {
-            channels
-        } else {
-            channels.filter { it.group == liveGroupFilter }
-        }
-        val dead = liveProbeResult.count { !it.value }
-        col.addView(topBar(
-            "直播",
-            back = { showRecommend() },
-            tail = buildString {
-                append("${shown.size}/${channels.size} 个频道")
-                if (liveProbeResult.isNotEmpty()) append(" · 已测活，死链 $dead")
-            },
-        ))
+        col.addView(topBar(title, back = { showRecommend() }, tail = tail))
 
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        bar.addView(button("源：" + activeLabel.take(12)) { pickLiveSource() })
-        bar.addView(button("添加直播源") { addLiveDialog() })
-        bar.addView(button("删除") { removeLiveSourceDialog() })
-        bar.addView(
-            button(if (liveGroupFilter.isEmpty()) "分组" else "分组：" + liveGroupFilter.take(10)) {
-                val groups = listOf("全部分组") + channels.map { it.group }.distinct().sorted()
-                AlertDialog.Builder(this)
-                    .setTitle("按分组筛选")
-                    .setItems(groups.toTypedArray()) { _, which ->
-                        liveGroupFilter = if (which == 0) "" else groups[which]
-                        showLive()
-                    }
-                    .show()
-            },
-        )
-        bar.addView(button("测活") { probeLiveChannels(shown) })
+        if (liveShowFavorites) {
+            bar.addView(button("返回频道") { liveShowFavorites = false; showLive() })
+        } else {
+            bar.addView(button("源：" + activeLabel.take(12)) { pickLiveSource() })
+            bar.addView(button("添加直播源") { addLiveDialog() })
+            bar.addView(button("删除") { removeLiveSourceDialog() })
+            bar.addView(
+                button(if (liveGroupFilter.isEmpty()) "分组" else "分组：" + liveGroupFilter.take(10)) {
+                    val groups = listOf("全部分组") + liveShown.map { it.group }.distinct().sorted()
+                    AlertDialog.Builder(this)
+                        .setTitle("按分组筛选")
+                        .setItems(groups.toTypedArray()) { _, which ->
+                            liveGroupFilter = if (which == 0) "" else groups[which]
+                            showLive()
+                        }
+                        .show()
+                },
+            )
+        }
+        bar.addView(button(if (isSelectedFavorite()) "取消收藏" else "收藏") { toggleFavoriteSelected() })
+        bar.addView(button(if (liveShowFavorites) "收藏夹中" else "收藏夹") {
+            if (!liveShowFavorites) liveShowFavorites = true
+            showLive()
+        })
+        bar.addView(button("测活") { probeLiveChannels(liveShown) })
+        if (!liveShowFavorites) {
+            bar.addView(button(if (liveOnlyAlive) "只看可用 ✓" else "只看可用") {
+                liveOnlyAlive = !liveOnlyAlive
+                showLive()
+            })
+        }
         col.addView(hScroll(bar))
 
         val sorted = shown.sortedWith(compareBy({ it.group }, { it.name }))
         val listView = newList()
-        bindList(listView,
-            sorted.map { c ->
-                // 测过的画个记号：✗ 是已经确认打不开的，免得一个个点进去试
-                val mark = when (liveProbeResult[c.url]) {
-                    true -> "· "
-                    false -> "✗ "
-                    null -> ""
-                }
-                "$mark${c.group}  ·  ${c.name}"
-            },
-            onItem = { idx -> play(sorted[idx].url, sorted[idx].name) },
-        )
+        liveListView = listView
+        bindList(listView, sorted.map { liveRowLabel(it) },
+            onItem = { idx -> play(sorted[idx].url, sorted[idx].name) })
         col.addView(listView, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         setScreen(col)
         listView.requestFocus()
+    }
+
+    /** 行首色点：绿=测活通过，红=连不上，没有点=还没测；收藏的再加一颗星 */
+    private fun liveRowLabel(c: Channel): CharSequence {
+        val fav = prefs.isFavorite(c.url)
+        val color = when (liveProbeResult[c.url]) {
+            true -> 0xFF22C55E.toInt()
+            false -> 0xFFEF4444.toInt()
+            null -> 0
+        }
+        val text = "${c.group}  ·  ${c.name}"
+        if (color == 0 && !fav) return text
+        val prefix = StringBuilder()
+        if (fav) prefix.append("★ ")
+        val dotIndex = if (color != 0) { prefix.append("● "); prefix.length - 2 } else -1
+        val sp = SpannableString(prefix.toString() + text)
+        if (dotIndex >= 0) {
+            sp.setSpan(ForegroundColorSpan(color), dotIndex, dotIndex + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        if (fav) {
+            sp.setSpan(ForegroundColorSpan(0xFFFBBF24.toInt()), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        return sp
+    }
+
+    private fun favoritesAsChannels(): List<Channel> =
+        prefs.favorites().map { Channel(it.name, it.url, it.group.ifEmpty { "收藏" }, "") }
+
+    private fun selectedChannel(): Channel? {
+        val lv = liveListView ?: return null
+        val pos = lv.selectedItemPosition
+        val sorted = liveShown.sortedWith(compareBy({ it.group }, { it.name }))
+        return sorted.getOrNull(pos)
+    }
+
+    private fun isSelectedFavorite(): Boolean = selectedChannel()?.let { prefs.isFavorite(it.url) } ?: false
+
+    private fun toggleFavoriteSelected() {
+        val c = selectedChannel()
+        if (c == null) {
+            toast("先用遥控器选中一个频道")
+            return
+        }
+        val now = prefs.toggleFavorite(FavLive(c.name, c.url, c.group))
+        toast(if (now) "已收藏：${c.name}" else "已取消收藏：${c.name}")
+        showLive()
     }
 
     /** 当前源的分组信息是否可用：全都空或全是一个「其他」就说明 m3u 里没带分组 */
@@ -3816,7 +3893,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun simpleAdapter(items: List<String>, onItem: (Int) -> Unit): BaseAdapter =
+    private fun simpleAdapter(items: List<CharSequence>, onItem: (Int) -> Unit): BaseAdapter =
         object : BaseAdapter() {
             override fun getCount() = items.size
             override fun getItem(position: Int) = items[position]

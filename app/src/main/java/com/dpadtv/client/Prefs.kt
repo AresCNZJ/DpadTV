@@ -105,6 +105,41 @@ class Prefs(ctx: Context) {
         saveLiveSources(list.map { LiveSource("", it) })
     }
 
+    /** 收藏的频道（JSON 数组） */
+    fun favorites(): MutableList<FavLive> {
+        val text = sp.getString("live_favorites", "") ?: ""
+        if (text.isBlank()) return ArrayList()
+        return try {
+            val arr = JSONArray(text)
+            (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.let { FavLive.fromJson(it) } }
+                .toMutableList()
+        } catch (e: Exception) {
+            ArrayList()
+        }
+    }
+
+    fun saveFavorites(list: List<FavLive>) {
+        val arr = JSONArray()
+        list.forEach { arr.put(it.toJson()) }
+        sp.edit().putString("live_favorites", arr.toString()).apply()
+    }
+
+    fun isFavorite(url: String): Boolean = favorites().any { it.url == url }
+
+    /** 收藏/取消收藏，返回操作后是否处于收藏状态 */
+    fun toggleFavorite(ch: FavLive): Boolean {
+        val list = favorites()
+        val idx = list.indexOfFirst { it.url == ch.url }
+        if (idx >= 0) {
+            list.removeAt(idx)
+            saveFavorites(list)
+            return false
+        }
+        list.add(ch)
+        saveFavorites(list)
+        return true
+    }
+
     var activeLiveUrl: String
         get() = sp.getString("active_live", "") ?: ""
         set(v) = sp.edit().putString("active_live", v).apply()
@@ -358,4 +393,19 @@ object HomeBar {
 /** 一个直播源：显示名 + M3U 地址。name 可能为空（老数据或手动填写时没给）。 */
 data class LiveSource(val name: String, val url: String) {
     val label: String get() = name.ifEmpty { url.substringAfter("//").substringBefore('/') }
+}
+
+/** 收藏的直播频道：跨直播源保存，只记名字/地址/分组，不依赖当前源是否还活着。 */
+data class FavLive(val name: String, val url: String, val group: String) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("name", name); put("url", url); put("group", group)
+    }
+
+    companion object {
+        fun fromJson(o: JSONObject): FavLive? {
+            val u = o.optString("url", "")
+            if (u.isEmpty()) return null
+            return FavLive(o.optString("name", ""), u, o.optString("group", ""))
+        }
+    }
 }
