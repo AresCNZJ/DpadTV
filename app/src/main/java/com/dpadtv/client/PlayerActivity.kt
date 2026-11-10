@@ -359,8 +359,14 @@ class PlayerActivity : Activity() {
                     bottomMargin = dp(10)
                 },
             )
-            addView(bufferingText)
-            addView(speedText)
+            // 必须显式给 WRAP_CONTENT：LinearLayout 竖直方向的默认 LayoutParams 宽度是
+            // MATCH_PARENT，会让两行文字被按上面转圈的 40dp 宽度裁掉（实测只剩两个字）
+            val wrap = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
+            addView(bufferingText, wrap)
+            addView(speedText, LinearLayout.LayoutParams(wrap))
         }
         root.addView(
             bufferingBox,

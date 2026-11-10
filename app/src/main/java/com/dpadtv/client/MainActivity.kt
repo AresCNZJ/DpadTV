@@ -1933,6 +1933,12 @@ class MainActivity : Activity() {
     }
 
     /** 空状态：与其给一张空白列表，不如把「下一步点哪」直接摆出来 */
+    /**
+     * 空状态：只解释「片源是什么」。
+     *
+     * 不再放「从服务器同步 / 手动添加」两个按钮 —— 服务端不一定配了 DEFAULT_SOURCES，
+     * 把人往那条路上引经常扑空；真正的入口是顶栏那个「添加片源」，六种方式都在里面。
+     */
     private fun emptySourcesCard(): LinearLayout = card().apply {
         setPadding(dp(24), dp(20), dp(24), dp(20))
         addView(TextView(this@MainActivity).apply {
@@ -1941,18 +1947,12 @@ class MainActivity : Activity() {
             setTextSize(19f)
         })
         addView(TextView(this@MainActivity).apply {
-            text = "片源就是提供影片数据的采集站。最省事的是从服务器同步 —— " +
-                "服务端配了 DEFAULT_SOURCES 的话，一个地址都不用敲。"
+            text = "片源就是提供影片数据的采集站。"
             setTextColor(Ui.TEXT_DIM)
             setTextSize(14f)
             setLineSpacing(dp(4).toFloat(), 1f)
-            setPadding(0, dp(10), 0, dp(16))
+            setPadding(0, dp(10), 0, 0)
         })
-        addView(hScroll(LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(button("从服务器同步", primary = true) { importServerConfig() })
-            addView(button("手动添加") { showManualAdd() })
-        }))
     }
 
     /** 批量操作：平时用不到，但不给入口就只能一个个点 */
@@ -2220,22 +2220,90 @@ class MainActivity : Activity() {
         input.requestFocus()
     }
 
+    /** 添加片源列表里的一项：标题 + 一句说明 + 可选角标 */
+    private class AddOption(
+        val title: String,
+        val desc: String,
+        val badge: String? = null,
+        val key: String? = null,
+        val run: () -> Unit,
+    )
+
+    /** 服务器是否配了默认片源：null=还没问过 / ready / empty / error */
+    private var serverSourceState: String? = null
+
+    /** 「从服务器配置同步」那一行的引用：检测回来后原地更新，不重建页面 */
+    private var serverSyncRow: View? = null
+    private var serverSyncBadge: TextView? = null
+
+    /**
+     * 进页面时问一次服务端有没有配默认片源。
+     *
+     * 多数人不会去 LibreTV 服务端配 DEFAULT_SOURCES，那一项点进去只会拿到「没有片源」。
+     * 检测为空就把它置灰并写明「服务器未配置源」，省得白点一次；
+     * 有配置才恢复成可点。结果只更新那一行的角标与透明度，不重建页面（否则焦点会被弹回「返回」）。
+     */
+    private fun detectServerSources() {
+        scope.launch {
+            val state = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching { api.status() }.fold(
+                    { st ->
+                        if (st.defaultSources.isNotEmpty() || st.defaultSubscriptions.isNotEmpty()) "ready" else "empty"
+                    },
+                    { "error" },
+                )
+            }
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                serverSourceState = state
+                applyServerSourceState()
+            }
+        }
+    }
+
+    /** 按 serverSourceState 刷新「从服务器配置同步」这一行 */
+    private fun applyServerSourceState() {
+        val row = serverSyncRow ?: return
+        val badge = serverSyncBadge ?: return
+        val usable = serverSourceState == "ready"
+        badge.text = when (serverSourceState) {
+            "ready" -> "最省事"
+            "empty" -> "服务器未配置源"
+            "error" -> "检测失败"
+            else -> "检测中…"
+        }
+        // 不可用时角标也跟着走灰底，否则亮蓝色标签贴在暗行上会更刺眼
+        if (usable) {
+            badge.background = Ui.bg(this, Ui.ACCENT, 6)
+            badge.setTextColor(INK)
+        } else {
+            badge.background = Ui.bg(this, Ui.SURFACE_HI, 6, 0, 1, Ui.STROKE)
+            badge.setTextColor(Ui.TEXT_FAINT)
+        }
+        row.alpha = if (usable) 1f else 0.45f
+        row.isEnabled = usable
+    }
+
     /** 添加片源：应用内列表（不是弹窗） */
     private fun showAddSource() {
         currentScreen = "addsource"
 
         // 按「最省事 → 最麻烦」排序，每项一句用途说明。
         // 「从服务器配置同步」提到第一：多数人服务端早就配好了，这一步不用碰电视遥控器打字
+        // 扫码放第一位：这是唯一不用在电视上用遥控器敲字、也不用插 U 盘的方式，
+        // 手机扫一下就能把订阅文件传上电视。服务端同步退到第二，它只适用于服务端确实
+        // 配过 DEFAULT_SOURCES 的人，大部分人第一次进来这里其实是空的。
         val options = listOf(
-            Triple("从服务器配置同步", "读取服务端 DEFAULT_SOURCES，一步到位", { importServerConfig() }),
-            Triple("扫码添加", "手机扫码后在网页里选文件或粘贴", { showQrAdd() }),
-            Triple("粘贴文本", "从电脑复制 sources.json 内容，粘到这里", {
+            AddOption("扫码添加", "手机扫码后在网页里选文件或粘贴", badge = "推荐") { showQrAdd() },
+            AddOption("从服务器配置同步", "读取服务端 DEFAULT_SOURCES，一步到位", badge = "最省事", key = "server") {
+                importServerConfig()
+            },
+            AddOption("粘贴文本", "从电脑复制 sources.json 内容，粘到这里") {
                 inputPage("粘贴 sources.json", "把 sources.json 全文粘到这里", multiline = true) { v ->
                     if (v.isEmpty()) toast("内容为空") else importText(v)
                 }
-            }),
-            Triple("从设备文件选择", "读取 U 盘 / 下载目录里的 .json / .m3u", { pickJsonFile() }),
-            Triple("从网址导入", "填 sources.json 或订阅链接", {
+            },
+            AddOption("从设备文件选择", "读取 U 盘 / 下载目录里的 .json / .m3u") { pickJsonFile() },
+            AddOption("从网址导入", "填 sources.json 或订阅链接") {
                 inputPage("从网址导入", "https://example.com/sources.json") { u ->
                     if (u.isEmpty()) {
                         toast("请填地址")
@@ -2243,13 +2311,18 @@ class MainActivity : Activity() {
                         runApi("下载中…", { api.fetchText(u) }, { text -> importText(text) })
                     }
                 }
-            }),
-            Triple("手动添加采集站", "只添加一个 CMS 接口地址", { showManualAdd() }),
+            },
+            AddOption("手动添加采集站", "只添加一个 CMS 接口地址") { showManualAdd() },
         )
+
+        serverSyncRow = null
+        serverSyncBadge = null
 
         val col = screen(padH = 48, padV = 22)
         col.addView(topBar("添加片源", back = { showSources() }))
         col.addView(hintText("越靠上越省事 · 导入按地址去重追加，重复导入不会产生重复项"))
+        // 先问一次服务端有没有配默认片源，结果回来只刷新那一行，不重建页面
+        detectServerSources()
 
         val listView = newList(dividers = false)
         listView.adapter = object : BaseAdapter() {
@@ -2266,7 +2339,7 @@ class MainActivity : Activity() {
                         setPadding(dp(3), dp(3), dp(3), dp(3))
                     }
                 wrap.removeAllViews()
-                val (title, desc, _) = options[position]
+                val opt = options[position]
                 val row = LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
@@ -2281,25 +2354,31 @@ class MainActivity : Activity() {
                     gravity = Gravity.CENTER_VERTICAL
                 }
                 titleRow.addView(TextView(this@MainActivity).apply {
-                    text = title
+                    text = opt.title
                     setTextColor(TEXT_COLOR)
                     setTextSize(17f)
                 })
-                if (position == 0) {
-                    titleRow.addView(TextView(this@MainActivity).apply {
-                        text = "最省事"
+                opt.badge?.let { badge ->
+                    val badgeView = TextView(this@MainActivity).apply {
+                        text = badge
                         setTextColor(INK)
                         setTextSize(11f)
                         setPadding(dp(8), dp(2), dp(8), dp(2))
                         background = Ui.bg(this@MainActivity, Ui.ACCENT, 6)
-                    }, LinearLayout.LayoutParams(
+                    }
+                    titleRow.addView(badgeView, LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT,
                     ).apply { leftMargin = dp(10) })
+                    if (opt.key == "server") {
+                        serverSyncRow = row
+                        serverSyncBadge = badgeView
+                        applyServerSourceState()
+                    }
                 }
                 texts.addView(titleRow)
                 texts.addView(TextView(this@MainActivity).apply {
-                    text = desc
+                    text = opt.desc
                     setTextColor(Ui.TEXT_FAINT)
                     setTextSize(13f)
                     isSingleLine = true
@@ -2318,7 +2397,20 @@ class MainActivity : Activity() {
                 return wrap
             }
         }
-        listView.setOnItemClickListener { _, _, position, _ -> options[position].third() }
+        listView.setOnItemClickListener { _, _, position, _ ->
+            val opt = options[position]
+            if (opt.key == "server" && serverSourceState != "ready") {
+                toast(
+                    when (serverSourceState) {
+                        null -> "正在检测服务器配置…"
+                        "error" -> "连不上服务器，用扫码或手动添加吧"
+                        else -> "服务器上没有配置默认片源，用扫码或手动添加吧"
+                    },
+                )
+                return@setOnItemClickListener
+            }
+            opt.run()
+        }
         col.addView(listView, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
