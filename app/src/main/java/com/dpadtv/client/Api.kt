@@ -150,9 +150,15 @@ class Api(baseUrl: String) {
                 else -> null
             }
         }
+        // 订阅地址有两种下发形状：["https://..."] 和 [{"url":"https://..."}]，
+        // 只认字符串会把后者整段吞掉（服务端配了订阅、客户端却当没配）
         val subsArr = o.optJSONArray("defaultSubscriptions") ?: JSONArray()
         val defaultSubs = (0 until subsArr.length()).mapNotNull { i ->
-            subsArr.opt(i) as? String
+            when (val v = subsArr.opt(i)) {
+                is String -> v.ifEmpty { null }
+                is JSONObject -> v.optString("url", "").ifEmpty { null }
+                else -> null
+            }
         }
         return AppStatus(
             passwordRequired = o.optBoolean("passwordRequired", false),

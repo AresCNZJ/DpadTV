@@ -2294,7 +2294,7 @@ class MainActivity : Activity() {
         // 配过 DEFAULT_SOURCES 的人，大部分人第一次进来这里其实是空的。
         val options = listOf(
             AddOption("扫码添加", "手机扫码后在网页里选文件或粘贴", badge = "推荐") { showQrAdd() },
-            AddOption("从服务器配置同步", "读取服务端 DEFAULT_SOURCES，一步到位", badge = "最省事", key = "server") {
+            AddOption("从服务器配置同步", "读取服务端 DEFAULT_SOURCES / 订阅链接", badge = "最省事", key = "server") {
                 importServerConfig()
             },
             AddOption("粘贴文本", "从电脑复制 sources.json 内容，粘到这里") {
