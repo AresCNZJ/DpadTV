@@ -14,6 +14,11 @@ dist/
 # 本机调试用的截图（真机/模拟器现场图）
 docs/adb-*.png
 
+# 本机一次性的小工具（截图打码、捐赠码裁切），别人用不上
+tools/imgtool.py
+tools/mask_png.py
+tools/shots.py
+
 # release 签名（keystore 与密码不入库；密码在 local.properties）
 *.jks
 *.keystore
