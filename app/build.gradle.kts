@@ -21,8 +21,8 @@ android {
         // 23 = Android 6.0：Media3 的下限之上，老盒子都能装
         minSdk = 23
         targetSdk = 37
-        versionCode = 103
-        versionName = "1.3.0"
+        versionCode = 104
+        versionName = "1.3.1"
     }
 
     // release 签名从 local.properties 读（keystore 与密码都不入库）；

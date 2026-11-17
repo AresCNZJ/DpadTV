@@ -91,6 +91,11 @@ class MainActivity : Activity() {
     /** 搜索框里还没提交的文字，用于页面重建时恢复 */
     private var searchDraft = ""
     private var busyDialog: AlertDialog? = null
+    /** 首页右上角更新胶囊的容器：检测是异步的，结果回来时要能就地把胶囊插进去 */
+    private var capsuleHost: LinearLayout? = null
+    /** 设置页页脚（版本号 + 有没有新版本），检测结果回来时同样要就地刷新 */
+    private var footerView: TextView? = null
+
     /** 当前界面名，用于实现遥控器 BACK 的层级回退（否则任何界面按返回都会直接退出应用）。 */
     private var currentScreen = "setup"
     /** 设置页是否展开「服务器连接」区块。已连接时默认收起（低频操作不占首屏） */
@@ -1251,15 +1256,19 @@ class MainActivity : Activity() {
         setPadding(0, dp(18), 0, 0)
     }
     /**
-     * 更新检测：每次启动最多检查一次，且 6 小时内不重复请求。
-     * 请求只发一次（8 秒超时）；拿不到就放弃——失败也算作"已检查"，不会反复重试，
-     * 同时保留已知的新版本标记，不因一次断网就把提示抹掉。
+     * 更新检测：每次启动最多检查一次。
+     * 请求只发一次（8 秒超时），失败也不影响使用；成功的话已知的新版本标记会保留，
+     * 不因后面一次断网就把提示抹掉。
      */
     private fun maybeCheckUpdate() {
         val now = System.currentTimeMillis()
-        if (now - prefs.lastUpdateCheck < 6 * 3600_000L) return
+        // 拿到结果后 30 分钟内不再请求；请求失败（断网/被墙/限流）只等 10 分钟，
+        // 免得一次网络抖动就把更新提示压掉半天。
+        val gap = if (prefs.updateCheckFailed) 10 * 60_000L else 30 * 60_000L
+        if (now - prefs.lastUpdateCheck < gap) return
         UpdateChecker.check { info ->
             prefs.lastUpdateCheck = now
+            prefs.updateCheckFailed = info == null
             if (info == null) return@check
             if (UpdateChecker.isNewer(info.tag, BuildConfig.VERSION_NAME)) {
                 val firstSeen = prefs.latestTag != info.tag
@@ -1272,9 +1281,30 @@ class MainActivity : Activity() {
                 prefs.latestNotes = ""
                 prefs.latestUrl = ""
             }
+            // 检查是异步的：首页早就画好了，光把 latestTag 写进 prefs 不会自己长出胶囊。
+            // 以前只有进一次设置再回来（首页被重建）才看得到提示，现在就地补一次。
+            refreshUpdateHints()
         }
     }
     /* --------------------------------------------------------- 更新提示 */
+
+    /** 检测结果回来后，就地刷新首页胶囊与设置页页脚（不重建整页，免得焦点和滚动位置被重置） */
+    private fun refreshUpdateHints() {
+        // 只处理还挂在窗口上的视图：用户可能已经切到别的页面，那些视图已经脱离视图树
+        capsuleHost?.takeIf { it.isAttachedToWindow }?.let { host ->
+            host.removeAllViews()
+            updateCapsule()?.let { host.addView(it) }
+        }
+        // 设置页页脚是整块文本，直接原位换成一份新的
+        footerView?.takeIf { it.isAttachedToWindow }?.let { old ->
+            val parent = old.parent as? android.view.ViewGroup ?: return@let
+            val index = parent.indexOfChild(old)
+            parent.removeView(old)
+            val fresh = githubFooter()
+            parent.addView(fresh, index)
+            footerView = fresh
+        }
+    }
 
     /** 首页右上角的更新胶囊：有新版本且开关打开时才出现 */
     private fun updateCapsule(): TextView? {
@@ -1677,7 +1707,7 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT, dp(44),
             ).apply { topMargin = dp(20) },
         )
-        col.addView(githubFooter())
+        footerView = githubFooter().also { col.addView(it) }
         setScreen(ScrollView(this).apply { addView(col) })
     }
 
@@ -3804,7 +3834,12 @@ class MainActivity : Activity() {
             brandRow(),
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
         )
-        updateCapsule()?.let { brandBar.addView(it) }
+        capsuleHost = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        updateCapsule()?.let { capsuleHost?.addView(it) }
+        brandBar.addView(capsuleHost)
         col.addView(brandBar)
 
         // 顶部按「分类」和「工具」分两组：

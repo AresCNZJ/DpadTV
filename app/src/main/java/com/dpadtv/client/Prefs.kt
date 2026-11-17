@@ -302,6 +302,11 @@ class Prefs(ctx: Context) {
     var lastUpdateCheck: Long
         get() = sp.getLong("last_update_check", 0L)
         set(v) = sp.edit().putLong("last_update_check", v).apply()
+
+    /** 上一次更新检测是不是失败了（断网/被墙/限流），失败时下次只等 10 分钟就重试 */
+    var updateCheckFailed: Boolean
+        get() = sp.getBoolean("update_check_failed", false)
+        set(v) = sp.edit().putBoolean("update_check_failed", v).apply()
     /** 播放进度存在 pos:<hash> 键里，这里统计并整体清掉 */
     fun progressCount(): Int = sp.all.keys.count { it.startsWith("pos:") }
 
